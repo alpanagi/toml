@@ -6,9 +6,34 @@ const space: u8 = 0x20;
 const cr: u8 = 0x0D;
 const lf: u8 = 0x0A;
 
-const TokenKind = enum { new_line };
-const TokenValue = union(TokenKind) { new_line };
-const Token = struct { kind: TokenKind, value: ?TokenValue };
+const TokenKind = enum { new_line, identifier };
+const TokenValue = union(TokenKind) {
+    new_line,
+    identifier: []const u8,
+
+    pub fn deinit(self: TokenValue, alloc: std.mem.Allocator) void {
+        switch (self) {
+            .identifier => |str| alloc.free(str),
+            else => {},
+        }
+    }
+};
+const Token = struct {
+    kind: TokenKind,
+    value: ?TokenValue,
+
+    pub fn deinit(self: *Token, alloc: std.mem.Allocator) void {
+        if (self.value) |*value| value.deinit(alloc);
+    }
+};
+const TokenContainer = struct {
+    tokens: []Token,
+
+    pub fn deinit(self: *TokenContainer, alloc: std.mem.Allocator) void {
+        for (self.tokens) |*item| item.deinit(alloc);
+        alloc.free(self.tokens);
+    }
+};
 
 const State = struct {
     text: []const u8,
@@ -20,7 +45,7 @@ const TokenizerError = error{
     UnknownCharacter,
 };
 
-pub fn tokenizeAlloc(alloc: std.mem.Allocator, text: []const u8) ![]Token {
+pub fn tokenize(alloc: std.mem.Allocator, text: []const u8) !TokenContainer {
     var state: State = .{
         .text = text,
         .cursor = 0,
@@ -30,12 +55,14 @@ pub fn tokenizeAlloc(alloc: std.mem.Allocator, text: []const u8) ![]Token {
     while (state.cursor < text.len) {
         if (ignoreWhitespace(&state)) continue;
         if (ignoreComment(&state)) continue;
+
         if (try tokenizeNewLine(alloc, &state)) continue;
+        if (try tokenizeIdentifier(alloc, &state)) continue;
 
         return TokenizerError.UnknownCharacter;
     }
 
-    return state.tokens.toOwnedSlice(alloc);
+    return TokenContainer{ .tokens = try state.tokens.toOwnedSlice(alloc) };
 }
 
 fn ignoreWhitespace(state: *State) bool {
@@ -83,38 +110,76 @@ fn tokenizeNewLine(alloc: std.mem.Allocator, state: *State) !bool {
     return false;
 }
 
+fn tokenizeIdentifier(alloc: std.mem.Allocator, state: *State) !bool {
+    if (isValidIdentifierCharacter(state.text[state.cursor])) {
+        const identifierStart = state.cursor;
+        while (state.cursor < state.text.len and
+            isValidIdentifierCharacter(state.text[state.cursor]))
+        {
+            state.cursor += 1;
+        }
+
+        const identifier = try alloc.dupe(u8, state.text[identifierStart..state.cursor]);
+        try state.tokens.append(alloc, .{
+            .kind = TokenKind.identifier,
+            .value = TokenValue{ .identifier = identifier },
+        });
+        return true;
+    }
+    return false;
+}
+
+fn isValidIdentifierCharacter(character: u8) bool {
+    return switch (character) {
+        'a'...'z', 'A'...'Z', '0'...'9', '_', '-' => true,
+        else => false,
+    };
+}
+
 test "Comment" {
     const alloc = std.testing.allocator;
     const text = "# This is a comment";
 
-    const tokens = try tokenizeAlloc(alloc, text);
-    try std.testing.expectEqualSlices(Token, &.{}, tokens);
+    const token_container = try tokenize(alloc, text);
+    try std.testing.expectEqualSlices(Token, &.{}, token_container.tokens);
 }
 
 test "Multiline comments" {
     const alloc = std.testing.allocator;
     const text = "# This is a comment\n# This is another one\n";
 
-    const tokens = try tokenizeAlloc(alloc, text);
-    try std.testing.expectEqualSlices(Token, &.{}, tokens);
+    const token_container = try tokenize(alloc, text);
+    try std.testing.expectEqualSlices(Token, &.{}, token_container.tokens);
 }
 
 test "Multiline comments with padding" {
     const alloc = std.testing.allocator;
     const text = "    # This is a comment\n    # This is another one\n";
 
-    const tokens = try tokenizeAlloc(alloc, text);
-    try std.testing.expectEqualSlices(Token, &.{}, tokens);
+    const token_container = try tokenize(alloc, text);
+    try std.testing.expectEqualSlices(Token, &.{}, token_container.tokens);
 }
 
-test "Tokenize empty lines" {
+test "Empty line" {
     const alloc = std.testing.allocator;
     const text = "# This is a comment\n\n# This is another one\n";
 
-    const tokens = try tokenizeAlloc(alloc, text);
-    defer alloc.free(tokens);
+    var token_container = try tokenize(alloc, text);
+    defer token_container.deinit(alloc);
+
     try std.testing.expectEqualSlices(Token, &.{Token{
         .kind = TokenKind.new_line,
         .value = null,
-    }}, tokens);
+    }}, token_container.tokens);
+}
+
+test "Identifier" {
+    const alloc = std.testing.allocator;
+    const text = "Test_1234";
+
+    var token_container = try tokenize(alloc, text);
+    defer token_container.deinit(alloc);
+
+    try std.testing.expectEqual(TokenKind.identifier, token_container.tokens[0].kind);
+    try std.testing.expectEqualSlices(u8, text, token_container.tokens[0].value.?.identifier);
 }
