@@ -16,23 +16,26 @@ const State = struct {
     tokens: std.ArrayList(Token),
 };
 
-pub fn tokenizeAlloc(alloc: std.mem.Allocator, text: []const u8) ![]Token {
-    var tokens: std.ArrayList(Token) = try std.ArrayList(Token).initCapacity(alloc, 16);
-    errdefer tokens.deinit(alloc);
+const TokenizerError = error{
+    UnknownCharacter,
+};
 
+pub fn tokenizeAlloc(alloc: std.mem.Allocator, text: []const u8) ![]Token {
     var state: State = .{
         .text = text,
         .cursor = 0,
-        .tokens = tokens,
+        .tokens = std.ArrayList(Token).empty,
     };
 
     while (state.cursor < text.len) {
         if (ignoreWhitespace(&state)) continue;
         if (ignoreComment(&state)) continue;
         if (try tokenizeNewLine(alloc, &state)) continue;
+
+        return TokenizerError.UnknownCharacter;
     }
 
-    return tokens.toOwnedSlice(alloc);
+    return state.tokens.toOwnedSlice(alloc);
 }
 
 fn ignoreWhitespace(state: *State) bool {
@@ -49,7 +52,11 @@ fn ignoreWhitespace(state: *State) bool {
 
 fn ignoreComment(state: *State) bool {
     if (state.text[state.cursor] == '#') {
-        while (state.cursor < state.text.len and state.text[state.cursor] != lf) {
+        while (state.cursor < state.text.len) {
+            if (state.text[state.cursor] == lf) {
+                state.cursor += 1;
+                break;
+            }
             state.cursor += 1;
         }
         return true;
@@ -80,22 +87,34 @@ test "Comment" {
     const alloc = std.testing.allocator;
     const text = "# This is a comment";
 
-    const tokens = tokenizeAlloc(alloc, text);
-    try std.testing.expectEqualSlices(Token, &.{}, try tokens);
+    const tokens = try tokenizeAlloc(alloc, text);
+    try std.testing.expectEqualSlices(Token, &.{}, tokens);
 }
 
 test "Multiline comments" {
     const alloc = std.testing.allocator;
     const text = "# This is a comment\n# This is another one\n";
 
-    const tokens = tokenizeAlloc(alloc, text);
-    try std.testing.expectEqualSlices(Token, &.{}, try tokens);
+    const tokens = try tokenizeAlloc(alloc, text);
+    try std.testing.expectEqualSlices(Token, &.{}, tokens);
 }
 
 test "Multiline comments with padding" {
     const alloc = std.testing.allocator;
     const text = "    # This is a comment\n    # This is another one\n";
 
-    const tokens = tokenizeAlloc(alloc, text);
-    try std.testing.expectEqualSlices(Token, &.{}, try tokens);
+    const tokens = try tokenizeAlloc(alloc, text);
+    try std.testing.expectEqualSlices(Token, &.{}, tokens);
+}
+
+test "Tokenize empty lines" {
+    const alloc = std.testing.allocator;
+    const text = "# This is a comment\n\n# This is another one\n";
+
+    const tokens = try tokenizeAlloc(alloc, text);
+    defer alloc.free(tokens);
+    try std.testing.expectEqualSlices(Token, &.{Token{
+        .kind = TokenKind.new_line,
+        .value = null,
+    }}, tokens);
 }
