@@ -6,10 +6,11 @@ const space: u8 = 0x20;
 const cr: u8 = 0x0D;
 const lf: u8 = 0x0A;
 
-const TokenKind = enum { new_line, identifier };
+const TokenKind = enum { new_line, identifier, equals };
 const TokenValue = union(TokenKind) {
     new_line,
     identifier: []const u8,
+    equals,
 
     pub fn deinit(self: TokenValue, alloc: std.mem.Allocator) void {
         switch (self) {
@@ -57,6 +58,7 @@ pub fn tokenize(alloc: std.mem.Allocator, text: []const u8) !TokenContainer {
         if (ignoreComment(&state)) continue;
 
         if (try tokenizeNewLine(alloc, &state)) continue;
+        if (try tokenizeSymbols(alloc, &state)) continue;
         if (try tokenizeIdentifier(alloc, &state)) continue;
 
         return TokenizerError.UnknownCharacter;
@@ -104,6 +106,16 @@ fn tokenizeNewLine(alloc: std.mem.Allocator, state: *State) !bool {
     {
         state.cursor += 2;
         try state.tokens.append(alloc, .{ .kind = TokenKind.new_line, .value = null });
+        return true;
+    }
+
+    return false;
+}
+
+fn tokenizeSymbols(alloc: std.mem.Allocator, state: *State) !bool {
+    if (state.text[state.cursor] == '=') {
+        state.cursor += 1;
+        try state.tokens.append(alloc, .{ .kind = TokenKind.equals, .value = null });
         return true;
     }
 
@@ -182,4 +194,14 @@ test "Identifier" {
 
     try std.testing.expectEqual(TokenKind.identifier, token_container.tokens[0].kind);
     try std.testing.expectEqualSlices(u8, text, token_container.tokens[0].value.?.identifier);
+}
+
+test "equals" {
+    const alloc = std.testing.allocator;
+    const text = " =  ";
+
+    var token_container = try tokenize(alloc, text);
+    defer token_container.deinit(alloc);
+
+    try std.testing.expectEqual(TokenKind.equals, token_container.tokens[0].kind);
 }
