@@ -6,8 +6,8 @@ const space: u8 = 0x20;
 const cr: u8 = 0x0D;
 const lf: u8 = 0x0A;
 
-const TokenKind = enum { new_line, identifier, equals, string };
-const TokenValue = union(TokenKind) {
+pub const TokenKind = enum { new_line, identifier, equals, string };
+pub const TokenValue = union(TokenKind) {
     new_line,
     identifier: []const u8,
     equals,
@@ -21,7 +21,7 @@ const TokenValue = union(TokenKind) {
         }
     }
 };
-const Token = struct {
+pub const Token = struct {
     kind: TokenKind,
     value: ?TokenValue,
 
@@ -255,10 +255,10 @@ test "equals" {
 
 test "String" {
     const alloc = std.testing.allocator;
-    const input = "\"asdf\"";
+    const text = "\"asdf\"";
     const expected = "asdf";
 
-    var token_container = try tokenize(alloc, input);
+    var token_container = try tokenize(alloc, text);
     defer token_container.deinit(alloc);
 
     try std.testing.expectEqual(TokenKind.string, token_container.tokens[0].kind);
