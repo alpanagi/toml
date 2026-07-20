@@ -1,8 +1,8 @@
 .{
-    .name = .toml_parser,
+    .name = .toml,
     .version = "0.0.0",
-    .fingerprint = 0x6415e7e9517bec75,
     .minimum_zig_version = "0.16.0",
+    .fingerprint = 0x12c55c534c51d9c8,
     .dependencies = .{},
     .paths = .{
         "build.zig",

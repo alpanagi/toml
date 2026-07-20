@@ -53,7 +53,7 @@ pub fn parse(comptime T: type, alloc: std.mem.Allocator, text: []const u8) !T {
 
 test "Parse into struct" {
     const alloc = std.testing.allocator;
-    const text = "name = \"toml-parser\"";
+    const text = "name = \"toml\"";
 
     const Config = struct {
         name: []const u8,
@@ -62,12 +62,12 @@ test "Parse into struct" {
     const result = try parse(Config, alloc, text);
     defer alloc.free(result.name);
 
-    try std.testing.expectEqualSlices(u8, "toml-parser", result.name);
+    try std.testing.expectEqualSlices(u8, "toml", result.name);
 }
 
 test "Unknown key" {
     const alloc = std.testing.allocator;
-    const text = "name = \"toml-parser\"";
+    const text = "name = \"toml\"";
 
     const Config = struct {
         version: []const u8,
