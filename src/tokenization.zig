@@ -6,11 +6,13 @@ const space: u8 = 0x20;
 const cr: u8 = 0x0D;
 const lf: u8 = 0x0A;
 
-pub const TokenKind = enum { new_line, identifier, equals, string };
+pub const TokenKind = enum { new_line, equals, left_bracket, right_bracket, identifier, string };
 pub const TokenValue = union(TokenKind) {
     new_line,
-    identifier: []const u8,
     equals,
+    left_bracket,
+    right_bracket,
+    identifier: []const u8,
     string: []const u8,
 
     pub fn deinit(self: TokenValue, alloc: std.mem.Allocator) void {
@@ -119,6 +121,18 @@ fn tokenizeSymbols(alloc: std.mem.Allocator, state: *State) !bool {
     if (state.text[state.cursor] == '=') {
         state.cursor += 1;
         try state.tokens.append(alloc, .{ .kind = TokenKind.equals, .value = null });
+        return true;
+    }
+
+    if (state.text[state.cursor] == '[') {
+        state.cursor += 1;
+        try state.tokens.append(alloc, .{ .kind = TokenKind.left_bracket, .value = null });
+        return true;
+    }
+
+    if (state.text[state.cursor] == ']') {
+        state.cursor += 1;
+        try state.tokens.append(alloc, .{ .kind = TokenKind.right_bracket, .value = null });
         return true;
     }
 
@@ -263,6 +277,19 @@ test "String" {
 
     try std.testing.expectEqual(TokenKind.string, token_container.tokens[0].kind);
     try std.testing.expectEqualSlices(u8, expected, token_container.tokens[0].value.?.string);
+}
+
+test "Brackets" {
+    const alloc = std.testing.allocator;
+    const text = "[]";
+
+    var token_container = try tokenize(alloc, text);
+    defer token_container.deinit(alloc);
+
+    try std.testing.expectEqualSlices(Token, &.{
+        Token{ .kind = TokenKind.left_bracket, .value = null },
+        Token{ .kind = TokenKind.right_bracket, .value = null },
+    }, token_container.tokens);
 }
 
 test "Unterminated string" {
