@@ -2,57 +2,54 @@ const std = @import("std");
 
 const tokenization = @import("tokenization.zig");
 
-pub const KeyValue = struct {
-    key: []const u8,
-    value: []const u8,
-};
+pub const ValueKind = enum { string, table };
+pub const Value = union(ValueKind) {
+    string: []const u8,
+    table: []KeyValuePair,
 
-pub const ParsedDataKind = enum { key_value };
-pub const ParsedDataValue = union(ParsedDataKind) {
-    key_value: KeyValue,
-
-    pub fn deinit(self: ParsedDataValue, alloc: std.mem.Allocator) void {
-        switch (self) {
-            .key_value => |key_value| {
-                alloc.free(key_value.key);
-                alloc.free(key_value.value);
+    pub fn deinit(self: *Value, alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .string => |string| alloc.free(string),
+            .table => |table| for (table) |*entry| {
+                entry.deinit(alloc);
             },
         }
     }
 };
-pub const ParsedData = struct {
-    kind: ParsedDataKind,
-    value: ?ParsedDataValue,
+pub const KeyValuePair = struct {
+    key: []const u8,
+    value: Value,
 
-    pub fn deinit(self: *ParsedData, alloc: std.mem.Allocator) void {
-        if (self.value) |*value| value.deinit(alloc);
+    pub fn deinit(self: *KeyValuePair, alloc: std.mem.Allocator) void {
+        alloc.free(self.key);
+        self.value.deinit(alloc);
     }
 };
 
-pub const ParsedDataContainer = struct {
-    items: []ParsedData,
+pub const ParsedData = struct {
+    key_value_pairs: []KeyValuePair,
 
-    pub fn deinit(self: *ParsedDataContainer, alloc: std.mem.Allocator) void {
-        for (self.items) |*item| item.deinit(alloc);
-        alloc.free(self.items);
+    pub fn deinit(self: *ParsedData, alloc: std.mem.Allocator) void {
+        for (self.key_value_pairs) |*key_value_pair| key_value_pair.deinit(alloc);
+        alloc.free(self.key_value_pairs);
     }
 };
 
 const State = struct {
     tokens: []const tokenization.Token,
     cursor: usize,
-    items: std.ArrayList(ParsedData),
+    key_value_pairs: std.ArrayList(KeyValuePair),
 };
 
 const ParserError = error{
     UnexpectedToken,
 };
 
-pub fn parse(alloc: std.mem.Allocator, tokens: []const tokenization.Token) !ParsedDataContainer {
+pub fn parse(alloc: std.mem.Allocator, tokens: []const tokenization.Token) !ParsedData {
     var state: State = .{
         .tokens = tokens,
         .cursor = 0,
-        .items = std.ArrayList(ParsedData).empty,
+        .key_value_pairs = std.ArrayList(KeyValuePair).empty,
     };
 
     while (state.cursor < state.tokens.len) {
@@ -62,7 +59,7 @@ pub fn parse(alloc: std.mem.Allocator, tokens: []const tokenization.Token) !Pars
         return ParserError.UnexpectedToken;
     }
 
-    return ParsedDataContainer{ .items = try state.items.toOwnedSlice(alloc) };
+    return ParsedData{ .key_value_pairs = try state.key_value_pairs.toOwnedSlice(alloc) };
 }
 
 fn ignoreEmptyLine(state: *State) bool {
@@ -78,16 +75,22 @@ fn parseKeyValue(alloc: std.mem.Allocator, state: *State) !bool {
     if (state.tokens[state.cursor].kind != .identifier) return false;
     if (state.tokens[state.cursor + 1].kind != .equals) return false;
     if (state.tokens[state.cursor + 2].kind != .string) return false;
+    if (state.tokens.len > state.cursor + 3 and state.tokens[state.cursor + 3].kind != .new_line) {
+        return false;
+    }
 
     const key = state.tokens[state.cursor].value.?.identifier;
     const value = state.tokens[state.cursor + 2].value.?.string;
 
-    try state.items.append(alloc, .{
-        .kind = ParsedDataKind.key_value,
-        .value = ParsedDataValue{ .key_value = .{
-            .key = try alloc.dupe(u8, key),
-            .value = try alloc.dupe(u8, value),
-        } },
+    const key_dupe = try alloc.dupe(u8, key);
+    errdefer alloc.free(key_dupe);
+
+    const value_dupe = try alloc.dupe(u8, value);
+    errdefer alloc.free(value_dupe);
+
+    try state.key_value_pairs.append(alloc, .{
+        .key = key_dupe,
+        .value = .{ .string = value_dupe },
     });
     state.cursor += 3;
     return true;
@@ -103,7 +106,7 @@ test "New lines" {
     var container = try parse(alloc, token_container.tokens);
     defer container.deinit(alloc);
 
-    try std.testing.expectEqualSlices(ParsedData, &.{}, container.items);
+    try std.testing.expectEqualSlices(KeyValuePair, &.{}, container.key_value_pairs);
 }
 
 test "Key value" {
@@ -116,10 +119,9 @@ test "Key value" {
     var container = try parse(alloc, token_container.tokens);
     defer container.deinit(alloc);
 
-    try std.testing.expectEqual(1, container.items.len);
-    try std.testing.expectEqual(ParsedDataKind.key_value, container.items[0].kind);
-    try std.testing.expectEqualSlices(u8, "key", container.items[0].value.?.key_value.key);
-    try std.testing.expectEqualSlices(u8, "value", container.items[0].value.?.key_value.value);
+    try std.testing.expectEqual(1, container.key_value_pairs.len);
+    try std.testing.expectEqualSlices(u8, "key", container.key_value_pairs[0].key);
+    try std.testing.expectEqualSlices(u8, "value", container.key_value_pairs[0].value.string);
 }
 
 test "Missing equals" {
@@ -135,6 +137,16 @@ test "Missing equals" {
 test "Missing string value" {
     const alloc = std.testing.allocator;
     const text = "key = not_a_string";
+
+    var token_container = try tokenization.tokenize(alloc, text);
+    defer token_container.deinit(alloc);
+
+    try std.testing.expectError(ParserError.UnexpectedToken, parse(alloc, token_container.tokens));
+}
+
+test "Two key values on the same line" {
+    const alloc = std.testing.allocator;
+    const text = "key1 = \"value1\" key2 = \"value2\"";
 
     var token_container = try tokenization.tokenize(alloc, text);
     defer token_container.deinit(alloc);
