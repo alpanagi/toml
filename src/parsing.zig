@@ -10,8 +10,9 @@ pub const Value = union(ValueKind) {
     pub fn deinit(self: *Value, alloc: std.mem.Allocator) void {
         switch (self.*) {
             .string => |string| alloc.free(string),
-            .table => |table| for (table) |*entry| {
-                entry.deinit(alloc);
+            .table => |table| {
+                for (table) |*entry| entry.deinit(alloc);
+                alloc.free(table);
             },
         }
     }
@@ -39,6 +40,8 @@ const State = struct {
     tokens: []const tokenization.Token,
     cursor: usize,
     key_value_pairs: std.ArrayList(KeyValuePair),
+    current_table_name: ?[]const u8,
+    current_table_entries: std.ArrayList(KeyValuePair),
 };
 
 const ParserError = error{
@@ -50,14 +53,20 @@ pub fn parse(alloc: std.mem.Allocator, tokens: []const tokenization.Token) !Pars
         .tokens = tokens,
         .cursor = 0,
         .key_value_pairs = std.ArrayList(KeyValuePair).empty,
+
+        .current_table_name = null,
+        .current_table_entries = std.ArrayList(KeyValuePair).empty,
     };
 
     while (state.cursor < state.tokens.len) {
         if (ignoreEmptyLine(&state)) continue;
+        if (try parseTable(alloc, &state)) continue;
         if (try parseKeyValue(alloc, &state)) continue;
 
         return ParserError.UnexpectedToken;
     }
+
+    try finalizeCurrentTable(alloc, &state);
 
     return ParsedData{ .key_value_pairs = try state.key_value_pairs.toOwnedSlice(alloc) };
 }
@@ -68,6 +77,24 @@ fn ignoreEmptyLine(state: *State) bool {
         return true;
     }
     return false;
+}
+
+fn parseTable(alloc: std.mem.Allocator, state: *State) !bool {
+    if (state.tokens.len < state.cursor + 3) return false;
+    if (state.tokens[state.cursor].kind != .left_bracket) return false;
+    if (state.tokens[state.cursor + 1].kind != .identifier) return false;
+    if (state.tokens[state.cursor + 2].kind != .right_bracket) return false;
+
+    const name_dupe = try alloc.dupe(u8, state.tokens[state.cursor + 1].value.?.identifier);
+    errdefer alloc.free(name_dupe);
+
+    if (state.current_table_name != null) {
+        try finalizeCurrentTable(alloc, state);
+    }
+    state.current_table_name = name_dupe;
+    state.cursor += 3;
+
+    return true;
 }
 
 fn parseKeyValue(alloc: std.mem.Allocator, state: *State) !bool {
@@ -88,12 +115,40 @@ fn parseKeyValue(alloc: std.mem.Allocator, state: *State) !bool {
     const value_dupe = try alloc.dupe(u8, value);
     errdefer alloc.free(value_dupe);
 
-    try state.key_value_pairs.append(alloc, .{
-        .key = key_dupe,
-        .value = .{ .string = value_dupe },
-    });
+    if (state.current_table_name == null) {
+        try state.key_value_pairs.append(alloc, .{
+            .key = key_dupe,
+            .value = .{ .string = value_dupe },
+        });
+    } else {
+        try state.current_table_entries.append(alloc, .{
+            .key = key_dupe,
+            .value = .{ .string = value_dupe },
+        });
+    }
+
     state.cursor += 3;
     return true;
+}
+
+fn finalizeCurrentTable(alloc: std.mem.Allocator, state: *State) !void {
+    if (state.current_table_name != null) {
+        const name_dupe = try alloc.dupe(u8, state.current_table_name.?);
+        errdefer alloc.free(name_dupe);
+
+        alloc.free(state.current_table_name.?);
+
+        try state.key_value_pairs.append(alloc, KeyValuePair{
+            .key = name_dupe,
+            .value = .{
+                .table = try state.current_table_entries.toOwnedSlice(alloc),
+            },
+        });
+
+        state.current_table_name = null;
+        state.current_table_entries.deinit(alloc);
+        state.current_table_entries = std.ArrayList(KeyValuePair).empty;
+    }
 }
 
 test "New lines" {
@@ -152,4 +207,48 @@ test "Two key values on the same line" {
     defer token_container.deinit(alloc);
 
     try std.testing.expectError(ParserError.UnexpectedToken, parse(alloc, token_container.tokens));
+}
+
+test "Table after root key value pairs" {
+    const alloc = std.testing.allocator;
+    const text = "root_key = \"root_value\"\n[table]\nkey = \"value\"\n";
+
+    var token_container = try tokenization.tokenize(alloc, text);
+    defer token_container.deinit(alloc);
+
+    var container = try parse(alloc, token_container.tokens);
+    defer container.deinit(alloc);
+
+    try std.testing.expectEqual(2, container.key_value_pairs.len);
+
+    try std.testing.expectEqualSlices(u8, "root_key", container.key_value_pairs[0].key);
+    try std.testing.expectEqualSlices(u8, "root_value", container.key_value_pairs[0].value.string);
+
+    try std.testing.expectEqualSlices(u8, "table", container.key_value_pairs[1].key);
+    try std.testing.expectEqual(1, container.key_value_pairs[1].value.table.len);
+    try std.testing.expectEqualSlices(u8, "key", container.key_value_pairs[1].value.table[0].key);
+    try std.testing.expectEqualSlices(u8, "value", container.key_value_pairs[1].value.table[0].value.string);
+}
+
+test "Two tables" {
+    const alloc = std.testing.allocator;
+    const text = "[table1]\nkey1 = \"value1\"\n[table2]\nkey2 = \"value2\"\n";
+
+    var token_container = try tokenization.tokenize(alloc, text);
+    defer token_container.deinit(alloc);
+
+    var container = try parse(alloc, token_container.tokens);
+    defer container.deinit(alloc);
+
+    try std.testing.expectEqual(2, container.key_value_pairs.len);
+
+    try std.testing.expectEqualSlices(u8, "table1", container.key_value_pairs[0].key);
+    try std.testing.expectEqual(1, container.key_value_pairs[0].value.table.len);
+    try std.testing.expectEqualSlices(u8, "key1", container.key_value_pairs[0].value.table[0].key);
+    try std.testing.expectEqualSlices(u8, "value1", container.key_value_pairs[0].value.table[0].value.string);
+
+    try std.testing.expectEqualSlices(u8, "table2", container.key_value_pairs[1].key);
+    try std.testing.expectEqual(1, container.key_value_pairs[1].value.table.len);
+    try std.testing.expectEqualSlices(u8, "key2", container.key_value_pairs[1].value.table[0].key);
+    try std.testing.expectEqualSlices(u8, "value2", container.key_value_pairs[1].value.table[0].value.string);
 }
