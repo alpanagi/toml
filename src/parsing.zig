@@ -102,9 +102,9 @@ fn parseTable(alloc: std.mem.Allocator, state: *State) !bool {
 
     while (true) {
         if (cursor >= state.tokens.len) return ParserError.UnexpectedToken;
-        if (state.tokens[cursor].kind != .identifier) return ParserError.UnexpectedToken;
 
-        const segment = try alloc.dupe(u8, state.tokens[cursor].value.?.identifier);
+        const name = keyText(state.tokens[cursor]) orelse return ParserError.UnexpectedToken;
+        const segment = try alloc.dupe(u8, name);
         errdefer alloc.free(segment);
         try path.append(alloc, segment);
         cursor += 1;
@@ -150,11 +150,10 @@ fn parseTable(alloc: std.mem.Allocator, state: *State) !bool {
 }
 
 fn parseKeyValue(alloc: std.mem.Allocator, state: *State) !bool {
-    if (state.tokens[state.cursor].kind != .identifier) return false;
+    const key = keyText(state.tokens[state.cursor]) orelse return false;
     if (state.cursor + 1 >= state.tokens.len) return ParserError.UnexpectedToken;
     if (state.tokens[state.cursor + 1].kind != .equals) return ParserError.UnexpectedToken;
 
-    const key = state.tokens[state.cursor].value.?.identifier;
     state.cursor += 2;
 
     var value = try parseValue(alloc, state);
@@ -279,6 +278,14 @@ fn appendTableToArray(alloc: std.mem.Allocator, pairs: *[]KeyValuePair, key: []c
     try appendPair(alloc, pairs, .{ .key = key_dupe, .value = .{ .array = &.{} } });
 
     return appendValue(alloc, &pairs.*[pairs.len - 1].value.array, .{ .table = &.{} });
+}
+
+fn keyText(token: tokenization.Token) ?[]const u8 {
+    return switch (token.kind) {
+        .identifier => token.value.?.identifier,
+        .string => token.value.?.string,
+        else => null,
+    };
 }
 
 fn findPair(pairs: []KeyValuePair, key: []const u8) ?*KeyValuePair {
@@ -493,6 +500,53 @@ test "Dotted table header" {
     const server = container.key_value_pairs[0].value.table;
     try std.testing.expectEqualSlices(u8, "tls", server[0].key);
     try std.testing.expectEqualSlices(u8, "yes", server[0].value.table[0].value.string);
+}
+
+test "Quoted key" {
+    const alloc = std.testing.allocator;
+    const text = "\"engine/Transform\" = \"value\"\n";
+
+    var token_container = try tokenization.tokenize(alloc, text);
+    defer token_container.deinit(alloc);
+
+    var container = try parse(alloc, token_container.tokens);
+    defer container.deinit(alloc);
+
+    try std.testing.expectEqualSlices(u8, "engine/Transform", container.key_value_pairs[0].key);
+    try std.testing.expectEqualSlices(u8, "value", container.key_value_pairs[0].value.string);
+}
+
+test "Quoted table header segment" {
+    const alloc = std.testing.allocator;
+    const text = "[[entity]]\n[entity.\"engine/Transform\"]\nposition = [0, 1]\n";
+
+    var token_container = try tokenization.tokenize(alloc, text);
+    defer token_container.deinit(alloc);
+
+    var container = try parse(alloc, token_container.tokens);
+    defer container.deinit(alloc);
+
+    const entities = container.key_value_pairs[0].value.array;
+    try std.testing.expectEqual(1, entities.len);
+    try std.testing.expectEqualSlices(u8, "engine/Transform", entities[0].table[0].key);
+    try std.testing.expectEqual(2, entities[0].table[0].value.table[0].value.array.len);
+}
+
+test "Fully quoted table header" {
+    const alloc = std.testing.allocator;
+    const text = "[\"a/b\".\"c/d\"]\nkey = \"value\"\n";
+
+    var token_container = try tokenization.tokenize(alloc, text);
+    defer token_container.deinit(alloc);
+
+    var container = try parse(alloc, token_container.tokens);
+    defer container.deinit(alloc);
+
+    try std.testing.expectEqualSlices(u8, "a/b", container.key_value_pairs[0].key);
+
+    const inner = container.key_value_pairs[0].value.table;
+    try std.testing.expectEqualSlices(u8, "c/d", inner[0].key);
+    try std.testing.expectEqualSlices(u8, "value", inner[0].value.table[0].value.string);
 }
 
 test "Array of tables" {

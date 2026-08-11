@@ -440,6 +440,42 @@ test "Omitted fields use defaults inside a nested table" {
     try std.testing.expectEqualSlices(u8, "none", result.server.tls.cert);
 }
 
+test "Quoted keys fill quoted field names" {
+    const alloc = std.testing.allocator;
+    const text =
+        \\[[entity]]
+        \\    [entity."engine/Transform"]
+        \\    position = [0,1.75,0,1]
+        \\    [entity."game/Health"]
+        \\    "max value" = 100
+        \\
+    ;
+
+    const Transform = struct {
+        position: [4]f32,
+    };
+    const Health = struct {
+        @"max value": u32,
+    };
+    const Entity = struct {
+        @"engine/Transform": ?Transform = null,
+        @"game/Health": ?Health = null,
+    };
+    const Level = struct {
+        entity: []Entity,
+    };
+
+    const result = try parse(Level, alloc, text);
+    defer deinit(Level, alloc, result);
+
+    try std.testing.expectEqual(1, result.entity.len);
+    try std.testing.expectEqual(
+        [4]f32{ 0, 1.75, 0, 1 },
+        result.entity[0].@"engine/Transform".?.position,
+    );
+    try std.testing.expectEqual(@as(u32, 100), result.entity[0].@"game/Health".?.@"max value");
+}
+
 test "Level file" {
     const alloc = std.testing.allocator;
     const text =
