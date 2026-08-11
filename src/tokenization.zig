@@ -6,14 +6,29 @@ const space: u8 = 0x20;
 const cr: u8 = 0x0D;
 const lf: u8 = 0x0A;
 
-pub const TokenKind = enum { new_line, equals, left_bracket, right_bracket, identifier, string };
+pub const TokenKind = enum {
+    new_line,
+    equals,
+    left_bracket,
+    right_bracket,
+    comma,
+    dot,
+    identifier,
+    string,
+    integer,
+    float,
+};
 pub const TokenValue = union(TokenKind) {
     new_line,
     equals,
     left_bracket,
     right_bracket,
+    comma,
+    dot,
     identifier: []const u8,
     string: []const u8,
+    integer: i64,
+    float: f64,
 
     pub fn deinit(self: TokenValue, alloc: std.mem.Allocator) void {
         switch (self) {
@@ -49,6 +64,7 @@ const State = struct {
 const TokenizerError = error{
     UnknownCharacter,
     UnterminatedString,
+    InvalidNumber,
 };
 
 pub fn tokenize(alloc: std.mem.Allocator, text: []const u8) !TokenContainer {
@@ -65,6 +81,7 @@ pub fn tokenize(alloc: std.mem.Allocator, text: []const u8) !TokenContainer {
         if (try tokenizeNewLine(alloc, &state)) continue;
         if (try tokenizeSymbols(alloc, &state)) continue;
         if (try tokenizeString(alloc, &state)) continue;
+        if (try tokenizeNumber(alloc, &state)) continue;
         if (try tokenizeIdentifier(alloc, &state)) continue;
 
         return TokenizerError.UnknownCharacter;
@@ -136,7 +153,59 @@ fn tokenizeSymbols(alloc: std.mem.Allocator, state: *State) !bool {
         return true;
     }
 
+    if (state.text[state.cursor] == ',') {
+        state.cursor += 1;
+        try state.tokens.append(alloc, .{ .kind = TokenKind.comma, .value = null });
+        return true;
+    }
+
+    if (state.text[state.cursor] == '.') {
+        state.cursor += 1;
+        try state.tokens.append(alloc, .{ .kind = TokenKind.dot, .value = null });
+        return true;
+    }
+
     return false;
+}
+
+fn tokenizeNumber(alloc: std.mem.Allocator, state: *State) !bool {
+    var number_end = state.cursor;
+    if (state.text[number_end] == '+' or state.text[number_end] == '-') number_end += 1;
+
+    if (number_end >= state.text.len) return false;
+    if (!std.ascii.isDigit(state.text[number_end])) return false;
+
+    var is_float = false;
+    while (number_end < state.text.len and isValidNumberCharacter(state.text[number_end])) {
+        if (state.text[number_end] == '.') is_float = true;
+        number_end += 1;
+    }
+
+    const number = state.text[state.cursor..number_end];
+    state.cursor = number_end;
+
+    if (is_float) {
+        const value = std.fmt.parseFloat(f64, number) catch return TokenizerError.InvalidNumber;
+        try state.tokens.append(alloc, .{
+            .kind = TokenKind.float,
+            .value = TokenValue{ .float = value },
+        });
+        return true;
+    }
+
+    const value = std.fmt.parseInt(i64, number, 10) catch return TokenizerError.InvalidNumber;
+    try state.tokens.append(alloc, .{
+        .kind = TokenKind.integer,
+        .value = TokenValue{ .integer = value },
+    });
+    return true;
+}
+
+fn isValidNumberCharacter(character: u8) bool {
+    return switch (character) {
+        '0'...'9', '_', '.' => true,
+        else => false,
+    };
 }
 
 fn tokenizeString(alloc: std.mem.Allocator, state: *State) !bool {
@@ -290,6 +359,66 @@ test "Brackets" {
         Token{ .kind = TokenKind.left_bracket, .value = null },
         Token{ .kind = TokenKind.right_bracket, .value = null },
     }, token_container.tokens);
+}
+
+test "Comma and dot" {
+    const alloc = std.testing.allocator;
+    const text = ",.";
+
+    var token_container = try tokenize(alloc, text);
+    defer token_container.deinit(alloc);
+
+    try std.testing.expectEqualSlices(Token, &.{
+        Token{ .kind = TokenKind.comma, .value = null },
+        Token{ .kind = TokenKind.dot, .value = null },
+    }, token_container.tokens);
+}
+
+test "Integers" {
+    const alloc = std.testing.allocator;
+    const text = "0 42 -7 +9 1_000";
+
+    var token_container = try tokenize(alloc, text);
+    defer token_container.deinit(alloc);
+
+    try std.testing.expectEqualSlices(Token, &.{
+        Token{ .kind = TokenKind.integer, .value = .{ .integer = 0 } },
+        Token{ .kind = TokenKind.integer, .value = .{ .integer = 42 } },
+        Token{ .kind = TokenKind.integer, .value = .{ .integer = -7 } },
+        Token{ .kind = TokenKind.integer, .value = .{ .integer = 9 } },
+        Token{ .kind = TokenKind.integer, .value = .{ .integer = 1000 } },
+    }, token_container.tokens);
+}
+
+test "Floats" {
+    const alloc = std.testing.allocator;
+    const text = "1.75 -0.5";
+
+    var token_container = try tokenize(alloc, text);
+    defer token_container.deinit(alloc);
+
+    try std.testing.expectEqualSlices(Token, &.{
+        Token{ .kind = TokenKind.float, .value = .{ .float = 1.75 } },
+        Token{ .kind = TokenKind.float, .value = .{ .float = -0.5 } },
+    }, token_container.tokens);
+}
+
+test "Identifier starting with a dash" {
+    const alloc = std.testing.allocator;
+    const text = "-key";
+
+    var token_container = try tokenize(alloc, text);
+    defer token_container.deinit(alloc);
+
+    try std.testing.expectEqual(TokenKind.identifier, token_container.tokens[0].kind);
+    try std.testing.expectEqualSlices(u8, text, token_container.tokens[0].value.?.identifier);
+}
+
+test "Invalid number" {
+    const alloc = std.testing.allocator;
+    const text = "1.2.3";
+
+    try std.testing.expectError(TokenizerError.InvalidNumber, tokenize(alloc, text));
 }
 
 test "Unterminated string" {
