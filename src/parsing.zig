@@ -220,7 +220,7 @@ fn descendPath(
     return cursor;
 }
 
-fn findPair(pairs: []KeyValuePair, key: []const u8) ?*KeyValuePair {
+pub fn findPair(pairs: []KeyValuePair, key: []const u8) ?*KeyValuePair {
     for (pairs) |*pair| {
         if (std.mem.eql(u8, pair.key, key)) return pair;
     }
