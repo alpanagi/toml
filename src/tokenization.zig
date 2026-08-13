@@ -16,6 +16,13 @@ pub const Token = union(enum) {
     float: f64,
     identifier: []const u8,
     string: []const u8,
+
+    pub fn getText(self: Token) ?[]const u8 {
+        return switch (self) {
+            .identifier, .string => |value| value,
+            else => null,
+        };
+    }
 };
 
 pub const TokenizerError = error{
@@ -116,8 +123,8 @@ fn tokenizeString(allocator: std.mem.Allocator, state: *State) !bool {
 
     if (cursor == state.text.len) return TokenizerError.UnterminatedString;
 
-    const string = try allocator.dupe(u8, state.text[start..cursor]);
     state.cursor = cursor + 1;
+    const string = try allocator.dupe(u8, state.text[start..cursor]);
     try state.tokens.append(allocator, .{ .string = string });
     return true;
 }
@@ -140,9 +147,8 @@ fn tokenizeNumber(allocator: std.mem.Allocator, state: *State) !bool {
         cursor += 1;
     }
 
-    const number = state.text[start..cursor];
     state.cursor = cursor;
-
+    const number = state.text[start..cursor];
     const token: Token = if (is_float)
         .{ .float = std.fmt.parseFloat(f64, number) catch return TokenizerError.InvalidNumber }
     else
@@ -154,15 +160,18 @@ fn tokenizeNumber(allocator: std.mem.Allocator, state: *State) !bool {
 
 fn tokenizeIdentifier(allocator: std.mem.Allocator, state: *State) !bool {
     const start = state.cursor;
-    while (state.cursor < state.text.len) {
-        switch (state.text[state.cursor]) {
-            'a'...'z', 'A'...'Z', '0'...'9', '_', '-' => state.cursor += 1,
+    var cursor = start;
+
+    while (cursor < state.text.len) {
+        switch (state.text[cursor]) {
+            'a'...'z', 'A'...'Z', '0'...'9', '_', '-' => cursor += 1,
             else => break,
         }
     }
-    if (state.cursor == start) return false;
+    if (cursor == start) return false;
 
-    const identifier = try allocator.dupe(u8, state.text[start..state.cursor]);
+    state.cursor = cursor;
+    const identifier = try allocator.dupe(u8, state.text[start..cursor]);
     try state.tokens.append(allocator, .{ .identifier = identifier });
     return true;
 }

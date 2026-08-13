@@ -2,290 +2,222 @@ const std = @import("std");
 
 const tokenization = @import("tokenization.zig");
 
-pub const ValueKind = enum { string, integer, float, array, table };
-pub const Value = union(ValueKind) {
-    string: []const u8,
-    integer: i64,
-    float: f64,
-    array: []Value,
-    table: []KeyValuePair,
+const Token = tokenization.Token;
 
-    pub fn deinit(self: *Value, alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .string => |string| alloc.free(string),
-            .array => |array| {
-                for (array) |*item| item.deinit(alloc);
-                alloc.free(array);
-            },
-            .table => |table| {
-                for (table) |*entry| entry.deinit(alloc);
-                alloc.free(table);
-            },
-            else => {},
-        }
-    }
-};
 pub const KeyValuePair = struct {
     key: []const u8,
     value: Value,
-
-    pub fn deinit(self: *KeyValuePair, alloc: std.mem.Allocator) void {
-        alloc.free(self.key);
-        self.value.deinit(alloc);
-    }
 };
 
-pub const ParsedData = struct {
-    key_value_pairs: []KeyValuePair,
+pub const Value = union(enum) {
+    string: []const u8,
+    integer: i64,
+    float: f64,
+    array: std.ArrayList(Value),
+    table: std.ArrayList(KeyValuePair),
+};
 
-    pub fn deinit(self: *ParsedData, alloc: std.mem.Allocator) void {
-        for (self.key_value_pairs) |*key_value_pair| key_value_pair.deinit(alloc);
-        alloc.free(self.key_value_pairs);
-    }
+pub const ParserError = error{
+    UnexpectedToken,
+    NotATable,
+    TableRedefined,
+    DuplicateKey,
+    EmptyPath,
 };
 
 const State = struct {
-    tokens: []const tokenization.Token,
+    tokens: []const Token,
     cursor: usize,
-    root: []KeyValuePair,
+    root_table: std.ArrayList(KeyValuePair),
     path: std.ArrayList([]const u8),
 };
 
-const ParserError = error{
-    UnexpectedToken,
-};
-
-pub fn parse(alloc: std.mem.Allocator, tokens: []const tokenization.Token) !ParsedData {
+pub fn parse(arena: *std.heap.ArenaAllocator, tokens: []const Token) ![]KeyValuePair {
+    const allocator = arena.allocator();
     var state: State = .{
         .tokens = tokens,
         .cursor = 0,
-        .root = &.{},
-        .path = std.ArrayList([]const u8).empty,
+        .root_table = .empty,
+        .path = .empty,
     };
-    defer clearPath(alloc, &state);
-    errdefer {
-        var root = Value{ .table = state.root };
-        root.deinit(alloc);
-    }
 
     while (state.cursor < state.tokens.len) {
-        if (ignoreEmptyLine(&state)) continue;
-        if (try parseTable(alloc, &state)) continue;
-        if (try parseKeyValue(alloc, &state)) continue;
+        if (ignoreNewLines(&state, &state.cursor)) continue;
+        if (try parseTable(allocator, &state)) continue;
+        if (try parseKeyValue(allocator, &state)) continue;
 
         return ParserError.UnexpectedToken;
     }
 
-    return ParsedData{ .key_value_pairs = state.root };
+    return state.root_table.items;
 }
 
-fn ignoreEmptyLine(state: *State) bool {
-    if (state.tokens[state.cursor].kind == .new_line) {
-        state.cursor += 1;
-        return true;
-    }
-    return false;
+fn ignoreNewLines(state: *State, cursor: *usize) bool {
+    const start = cursor.*;
+    while (isToken(state, cursor.*, .new_line)) cursor.* += 1;
+    return start != cursor.*;
 }
 
-fn parseTable(alloc: std.mem.Allocator, state: *State) !bool {
-    if (state.tokens[state.cursor].kind != .left_bracket) return false;
+fn parseTable(allocator: std.mem.Allocator, state: *State) !bool {
+    if (!isToken(state, state.cursor, .left_bracket)) return false;
 
     var cursor = state.cursor + 1;
-    const is_array = cursor < state.tokens.len and state.tokens[cursor].kind == .left_bracket;
-    if (is_array) cursor += 1;
+    const is_array_element = consumeToken(state, &cursor, .left_bracket);
 
     var path = std.ArrayList([]const u8).empty;
-    errdefer {
-        for (path.items) |segment| alloc.free(segment);
-        path.deinit(alloc);
-    }
-
     while (true) {
         if (cursor >= state.tokens.len) return ParserError.UnexpectedToken;
 
-        const name = keyText(state.tokens[cursor]) orelse return ParserError.UnexpectedToken;
-        const segment = try alloc.dupe(u8, name);
-        errdefer alloc.free(segment);
-        try path.append(alloc, segment);
+        const name = state.tokens[cursor].getText() orelse return ParserError.UnexpectedToken;
+        const segment = try allocator.dupe(u8, name);
+        try path.append(allocator, segment);
         cursor += 1;
 
-        if (cursor < state.tokens.len and state.tokens[cursor].kind == .dot) {
-            cursor += 1;
-            continue;
-        }
-        break;
+        if (!consumeToken(state, &cursor, .dot)) break;
     }
 
-    if (cursor >= state.tokens.len) return ParserError.UnexpectedToken;
-    if (state.tokens[cursor].kind != .right_bracket) return ParserError.UnexpectedToken;
-    cursor += 1;
+    if (!consumeToken(state, &cursor, .right_bracket)) return ParserError.UnexpectedToken;
+    if (is_array_element and !consumeToken(state, &cursor, .right_bracket)) return ParserError.UnexpectedToken;
 
-    if (is_array) {
-        if (cursor >= state.tokens.len) return ParserError.UnexpectedToken;
-        if (state.tokens[cursor].kind != .right_bracket) return ParserError.UnexpectedToken;
-        cursor += 1;
-    }
+    if (!isEndOfLine(state, cursor)) return ParserError.UnexpectedToken;
 
-    if (cursor < state.tokens.len and state.tokens[cursor].kind != .new_line) {
-        return ParserError.UnexpectedToken;
-    }
+    try insertTable(allocator, &state.root_table, path.items, is_array_element);
 
-    var container = &state.root;
-    for (path.items[0 .. path.items.len - 1]) |segment| {
-        container = try descend(alloc, container, segment);
-    }
-
-    const name = path.items[path.items.len - 1];
-    if (is_array) {
-        try appendTableToArray(alloc, container, name);
-    } else {
-        _ = try descend(alloc, container, name);
-    }
-
-    clearPath(alloc, state);
     state.path = path;
     state.cursor = cursor;
-
     return true;
 }
 
-fn parseKeyValue(alloc: std.mem.Allocator, state: *State) !bool {
-    const key = keyText(state.tokens[state.cursor]) orelse return false;
-    if (state.cursor + 1 >= state.tokens.len) return ParserError.UnexpectedToken;
-    if (state.tokens[state.cursor + 1].kind != .equals) return ParserError.UnexpectedToken;
+fn parseKeyValue(allocator: std.mem.Allocator, state: *State) !bool {
+    const key = state.tokens[state.cursor].getText() orelse return false;
 
-    state.cursor += 2;
+    var cursor = state.cursor + 1;
+    if (!consumeToken(state, &cursor, .equals)) return ParserError.UnexpectedToken;
 
-    var value = try parseValue(alloc, state);
-    errdefer value.deinit(alloc);
+    const value = try parseValue(allocator, state, &cursor);
 
-    if (state.cursor < state.tokens.len and state.tokens[state.cursor].kind != .new_line) {
-        return ParserError.UnexpectedToken;
-    }
+    if (!isEndOfLine(state, cursor)) return ParserError.UnexpectedToken;
 
-    const container = try resolvePath(alloc, state);
+    const key_dupe = try allocator.dupe(u8, key);
+    const path = try std.mem.concat(allocator, []const u8, &.{ state.path.items, &.{key_dupe} });
+    try insertValue(allocator, &state.root_table, path, value);
 
-    const key_dupe = try alloc.dupe(u8, key);
-    errdefer alloc.free(key_dupe);
-
-    try appendPair(alloc, container, .{ .key = key_dupe, .value = value });
-
+    state.cursor = cursor;
     return true;
 }
 
-fn parseValue(alloc: std.mem.Allocator, state: *State) !Value {
-    if (state.cursor >= state.tokens.len) return ParserError.UnexpectedToken;
+fn parseValue(allocator: std.mem.Allocator, state: *State, cursor: *usize) (ParserError || std.mem.Allocator.Error)!Value {
+    if (cursor.* >= state.tokens.len) return ParserError.UnexpectedToken;
 
-    const token = state.tokens[state.cursor];
-    switch (token.kind) {
-        .string => {
-            state.cursor += 1;
-            return Value{ .string = try alloc.dupe(u8, token.value.?.string) };
+    switch (state.tokens[cursor.*]) {
+        .string => |text| {
+            cursor.* += 1;
+            return .{ .string = try allocator.dupe(u8, text) };
         },
-        .integer => {
-            state.cursor += 1;
-            return Value{ .integer = token.value.?.integer };
+        .integer => |integer| {
+            cursor.* += 1;
+            return .{ .integer = integer };
         },
-        .float => {
-            state.cursor += 1;
-            return Value{ .float = token.value.?.float };
+        .float => |float| {
+            cursor.* += 1;
+            return .{ .float = float };
         },
-        .left_bracket => {},
+        .left_bracket => return .{ .array = try parseArray(allocator, state, cursor) },
         else => return ParserError.UnexpectedToken,
     }
+}
 
-    state.cursor += 1;
+fn parseArray(allocator: std.mem.Allocator, state: *State, cursor: *usize) (ParserError || std.mem.Allocator.Error)!std.ArrayList(Value) {
+    if (!consumeToken(state, cursor, .left_bracket)) return ParserError.UnexpectedToken;
 
-    var array: []Value = &.{};
-    errdefer {
-        var value = Value{ .array = array };
-        value.deinit(alloc);
-    }
+    var array: std.ArrayList(Value) = .empty;
 
     while (true) {
-        ignoreNewLines(state);
-        if (state.cursor >= state.tokens.len) return ParserError.UnexpectedToken;
+        _ = ignoreNewLines(state, cursor);
+        if (consumeToken(state, cursor, .right_bracket)) return array;
 
-        if (state.tokens[state.cursor].kind == .right_bracket) {
-            state.cursor += 1;
-            return Value{ .array = array };
-        }
+        try array.append(allocator, try parseValue(allocator, state, cursor));
 
-        var item = try parseValue(alloc, state);
-        errdefer item.deinit(alloc);
-        try appendValue(alloc, &array, item);
+        _ = ignoreNewLines(state, cursor);
+        if (consumeToken(state, cursor, .comma)) continue;
+        if (consumeToken(state, cursor, .right_bracket)) return array;
 
-        ignoreNewLines(state);
-        if (state.cursor >= state.tokens.len) return ParserError.UnexpectedToken;
-
-        switch (state.tokens[state.cursor].kind) {
-            .comma => state.cursor += 1,
-            .right_bracket => {
-                state.cursor += 1;
-                return Value{ .array = array };
-            },
-            else => return ParserError.UnexpectedToken,
-        }
+        return ParserError.UnexpectedToken;
     }
 }
 
-fn ignoreNewLines(state: *State) void {
-    while (state.cursor < state.tokens.len and state.tokens[state.cursor].kind == .new_line) {
-        state.cursor += 1;
-    }
-}
+fn insertTable(
+    allocator: std.mem.Allocator,
+    root: *std.ArrayList(KeyValuePair),
+    path: []const []const u8,
+    is_array_element: bool,
+) !void {
+    if (path.len == 0) return ParserError.EmptyPath;
 
-fn resolvePath(alloc: std.mem.Allocator, state: *State) !*[]KeyValuePair {
-    var container = &state.root;
-    for (state.path.items) |segment| {
-        container = try descend(alloc, container, segment);
-    }
-    return container;
-}
+    const container = try descendPath(allocator, root, path[0..(path.len - 1)]);
+    const key = path[path.len - 1];
 
-fn descend(alloc: std.mem.Allocator, pairs: *[]KeyValuePair, key: []const u8) !*[]KeyValuePair {
-    if (findPair(pairs.*, key)) |pair| {
+    if (findPair(container.items, key)) |pair| {
         switch (pair.value) {
-            .table => return &pair.value.table,
-            .array => {
-                if (pair.value.array.len == 0) return ParserError.UnexpectedToken;
-
-                const last = &pair.value.array[pair.value.array.len - 1];
-                if (last.* != .table) return ParserError.UnexpectedToken;
-                return &last.table;
+            .table => if (is_array_element) return ParserError.TableRedefined,
+            .array => |*array| {
+                if (!is_array_element) return ParserError.TableRedefined;
+                try array.append(allocator, .{ .table = .empty });
             },
-            else => return ParserError.UnexpectedToken,
+            else => return ParserError.TableRedefined,
+        }
+        return;
+    }
+
+    if (is_array_element) {
+        var array: std.ArrayList(Value) = .empty;
+        try array.append(allocator, .{ .table = .empty });
+        try container.append(allocator, .{ .key = key, .value = .{ .array = array } });
+    } else {
+        try container.append(allocator, .{ .key = key, .value = .{ .table = .empty } });
+    }
+}
+
+fn insertValue(
+    allocator: std.mem.Allocator,
+    root: *std.ArrayList(KeyValuePair),
+    path: []const []const u8,
+    value: Value,
+) !void {
+    if (path.len == 0) return ParserError.EmptyPath;
+
+    const container = try descendPath(allocator, root, path[0 .. path.len - 1]);
+    const key = path[path.len - 1];
+
+    if (findPair(container.items, key) != null) return ParserError.DuplicateKey;
+    try container.append(allocator, .{ .key = key, .value = value });
+}
+
+fn descendPath(
+    allocator: std.mem.Allocator,
+    root: *std.ArrayList(KeyValuePair),
+    path: []const []const u8,
+) !*std.ArrayList(KeyValuePair) {
+    var cursor = root;
+    for (path) |segment| {
+        if (findPair(cursor.items, segment)) |pair| {
+            switch (pair.value) {
+                .table => |*table| cursor = table,
+                .array => |*array| {
+                    if (array.items.len == 0) return ParserError.NotATable;
+                    const last = &array.items[array.items.len - 1];
+                    if (last.* != .table) return ParserError.NotATable;
+                    cursor = &last.table;
+                },
+                else => return ParserError.NotATable,
+            }
+        } else {
+            try cursor.append(allocator, .{ .key = segment, .value = .{ .table = .empty } });
+            cursor = &cursor.items[cursor.items.len - 1].value.table;
         }
     }
 
-    const key_dupe = try alloc.dupe(u8, key);
-    errdefer alloc.free(key_dupe);
-
-    try appendPair(alloc, pairs, .{ .key = key_dupe, .value = .{ .table = &.{} } });
-
-    return &pairs.*[pairs.len - 1].value.table;
-}
-
-fn appendTableToArray(alloc: std.mem.Allocator, pairs: *[]KeyValuePair, key: []const u8) !void {
-    if (findPair(pairs.*, key)) |pair| {
-        if (pair.value != .array) return ParserError.UnexpectedToken;
-        return appendValue(alloc, &pair.value.array, .{ .table = &.{} });
-    }
-
-    const key_dupe = try alloc.dupe(u8, key);
-    errdefer alloc.free(key_dupe);
-
-    try appendPair(alloc, pairs, .{ .key = key_dupe, .value = .{ .array = &.{} } });
-
-    return appendValue(alloc, &pairs.*[pairs.len - 1].value.array, .{ .table = &.{} });
-}
-
-fn keyText(token: tokenization.Token) ?[]const u8 {
-    return switch (token.kind) {
-        .identifier => token.value.?.identifier,
-        .string => token.value.?.string,
-        else => null,
-    };
+    return cursor;
 }
 
 fn findPair(pairs: []KeyValuePair, key: []const u8) ?*KeyValuePair {
@@ -295,295 +227,355 @@ fn findPair(pairs: []KeyValuePair, key: []const u8) ?*KeyValuePair {
     return null;
 }
 
-fn appendPair(alloc: std.mem.Allocator, pairs: *[]KeyValuePair, pair: KeyValuePair) !void {
-    pairs.* = try alloc.realloc(pairs.*, pairs.len + 1);
-    pairs.*[pairs.len - 1] = pair;
+fn isEndOfLine(state: *const State, cursor: usize) bool {
+    return cursor >= state.tokens.len or isToken(state, cursor, .new_line);
 }
 
-fn appendValue(alloc: std.mem.Allocator, values: *[]Value, value: Value) !void {
-    values.* = try alloc.realloc(values.*, values.len + 1);
-    values.*[values.len - 1] = value;
+fn consumeToken(state: *State, cursor: *usize, expected: std.meta.Tag(Token)) bool {
+    if (!isToken(state, cursor.*, expected)) return false;
+    cursor.* += 1;
+    return true;
 }
 
-fn clearPath(alloc: std.mem.Allocator, state: *State) void {
-    for (state.path.items) |segment| alloc.free(segment);
-    state.path.deinit(alloc);
-    state.path = std.ArrayList([]const u8).empty;
+fn isToken(state: *const State, cursor: usize, expected: std.meta.Tag(Token)) bool {
+    return cursor < state.tokens.len and state.tokens[cursor] == expected;
 }
 
-test "New lines" {
-    const alloc = std.testing.allocator;
+test "newline: input of only newlines produces no pairs" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
     const text = "\n\n\n";
+    const tokens = try tokenization.tokenize(&arena, text);
+    const pairs = try parse(&arena, tokens);
 
-    var token_container = try tokenization.tokenize(alloc, text);
-    defer token_container.deinit(alloc);
-
-    var container = try parse(alloc, token_container.tokens);
-    defer container.deinit(alloc);
-
-    try std.testing.expectEqualSlices(KeyValuePair, &.{}, container.key_value_pairs);
+    try std.testing.expectEqualSlices(KeyValuePair, &.{}, pairs);
 }
 
-test "Key value" {
-    const alloc = std.testing.allocator;
-    const text = "key = \"value\"";
+test "table: parses consecutive tables" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
 
-    var token_container = try tokenization.tokenize(alloc, text);
-    defer token_container.deinit(alloc);
-
-    var container = try parse(alloc, token_container.tokens);
-    defer container.deinit(alloc);
-
-    try std.testing.expectEqual(1, container.key_value_pairs.len);
-    try std.testing.expectEqualSlices(u8, "key", container.key_value_pairs[0].key);
-    try std.testing.expectEqualSlices(u8, "value", container.key_value_pairs[0].value.string);
-}
-
-test "Missing equals" {
-    const alloc = std.testing.allocator;
-    const text = "key key key";
-
-    var token_container = try tokenization.tokenize(alloc, text);
-    defer token_container.deinit(alloc);
-
-    try std.testing.expectError(ParserError.UnexpectedToken, parse(alloc, token_container.tokens));
-}
-
-test "Missing string value" {
-    const alloc = std.testing.allocator;
-    const text = "key = not_a_string";
-
-    var token_container = try tokenization.tokenize(alloc, text);
-    defer token_container.deinit(alloc);
-
-    try std.testing.expectError(ParserError.UnexpectedToken, parse(alloc, token_container.tokens));
-}
-
-test "Two key values on the same line" {
-    const alloc = std.testing.allocator;
-    const text = "key1 = \"value1\" key2 = \"value2\"";
-
-    var token_container = try tokenization.tokenize(alloc, text);
-    defer token_container.deinit(alloc);
-
-    try std.testing.expectError(ParserError.UnexpectedToken, parse(alloc, token_container.tokens));
-}
-
-test "Table after root key value pairs" {
-    const alloc = std.testing.allocator;
-    const text = "root_key = \"root_value\"\n[table]\nkey = \"value\"\n";
-
-    var token_container = try tokenization.tokenize(alloc, text);
-    defer token_container.deinit(alloc);
-
-    var container = try parse(alloc, token_container.tokens);
-    defer container.deinit(alloc);
-
-    try std.testing.expectEqual(2, container.key_value_pairs.len);
-
-    try std.testing.expectEqualSlices(u8, "root_key", container.key_value_pairs[0].key);
-    try std.testing.expectEqualSlices(u8, "root_value", container.key_value_pairs[0].value.string);
-
-    try std.testing.expectEqualSlices(u8, "table", container.key_value_pairs[1].key);
-    try std.testing.expectEqual(1, container.key_value_pairs[1].value.table.len);
-    try std.testing.expectEqualSlices(u8, "key", container.key_value_pairs[1].value.table[0].key);
-    try std.testing.expectEqualSlices(u8, "value", container.key_value_pairs[1].value.table[0].value.string);
-}
-
-test "Two tables" {
-    const alloc = std.testing.allocator;
     const text = "[table1]\nkey1 = \"value1\"\n[table2]\nkey2 = \"value2\"\n";
+    const tokens = try tokenization.tokenize(&arena, text);
+    const pairs = try parse(&arena, tokens);
 
-    var token_container = try tokenization.tokenize(alloc, text);
-    defer token_container.deinit(alloc);
+    try std.testing.expectEqual(2, pairs.len);
 
-    var container = try parse(alloc, token_container.tokens);
-    defer container.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, "table1", pairs[0].key);
+    try std.testing.expectEqual(1, pairs[0].value.table.items.len);
+    try std.testing.expectEqualSlices(u8, "key1", pairs[0].value.table.items[0].key);
+    try std.testing.expectEqualSlices(u8, "value1", pairs[0].value.table.items[0].value.string);
 
-    try std.testing.expectEqual(2, container.key_value_pairs.len);
-
-    try std.testing.expectEqualSlices(u8, "table1", container.key_value_pairs[0].key);
-    try std.testing.expectEqual(1, container.key_value_pairs[0].value.table.len);
-    try std.testing.expectEqualSlices(u8, "key1", container.key_value_pairs[0].value.table[0].key);
-    try std.testing.expectEqualSlices(u8, "value1", container.key_value_pairs[0].value.table[0].value.string);
-
-    try std.testing.expectEqualSlices(u8, "table2", container.key_value_pairs[1].key);
-    try std.testing.expectEqual(1, container.key_value_pairs[1].value.table.len);
-    try std.testing.expectEqualSlices(u8, "key2", container.key_value_pairs[1].value.table[0].key);
-    try std.testing.expectEqualSlices(u8, "value2", container.key_value_pairs[1].value.table[0].value.string);
+    try std.testing.expectEqualSlices(u8, "table2", pairs[1].key);
+    try std.testing.expectEqual(1, pairs[1].value.table.items.len);
+    try std.testing.expectEqualSlices(u8, "key2", pairs[1].value.table.items[0].key);
+    try std.testing.expectEqualSlices(u8, "value2", pairs[1].value.table.items[0].value.string);
 }
 
-test "Numbers" {
-    const alloc = std.testing.allocator;
+test "table: keeps root pairs declared before a header" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const text = "root_key = \"root_value\"\n[table]\nkey = \"value\"\n";
+    const tokens = try tokenization.tokenize(&arena, text);
+    const pairs = try parse(&arena, tokens);
+
+    try std.testing.expectEqual(2, pairs.len);
+
+    try std.testing.expectEqualSlices(u8, "root_key", pairs[0].key);
+    try std.testing.expectEqualSlices(u8, "root_value", pairs[0].value.string);
+
+    try std.testing.expectEqualSlices(u8, "table", pairs[1].key);
+    try std.testing.expectEqual(1, pairs[1].value.table.items.len);
+    try std.testing.expectEqualSlices(u8, "key", pairs[1].value.table.items[0].key);
+    try std.testing.expectEqualSlices(u8, "value", pairs[1].value.table.items[0].value.string);
+}
+
+test "table: dotted header nests tables" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const text = "[server.tls]\nenabled = \"yes\"\n";
+    const tokens = try tokenization.tokenize(&arena, text);
+    const pairs = try parse(&arena, tokens);
+
+    try std.testing.expectEqual(1, pairs.len);
+    try std.testing.expectEqualSlices(u8, "server", pairs[0].key);
+
+    const server = pairs[0].value.table.items;
+    try std.testing.expectEqualSlices(u8, "tls", server[0].key);
+    try std.testing.expectEqualSlices(u8, "yes", server[0].value.table.items[0].value.string);
+}
+
+test "table: accepts a quoted header segment" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const text = "[[entity]]\n[entity.\"engine/Transform\"]\nposition = [0, 1]\n";
+    const tokens = try tokenization.tokenize(&arena, text);
+    const pairs = try parse(&arena, tokens);
+
+    const entities = pairs[0].value.array.items;
+    try std.testing.expectEqual(1, entities.len);
+    try std.testing.expectEqualSlices(u8, "engine/Transform", entities[0].table.items[0].key);
+    try std.testing.expectEqual(2, entities[0].table.items[0].value.table.items[0].value.array.items.len);
+}
+
+test "table: accepts every segment quoted" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const text = "[\"a/b\".\"c/d\"]\nkey = \"value\"\n";
+    const tokens = try tokenization.tokenize(&arena, text);
+    const pairs = try parse(&arena, tokens);
+
+    try std.testing.expectEqualSlices(u8, "a/b", pairs[0].key);
+
+    const inner = pairs[0].value.table.items;
+    try std.testing.expectEqualSlices(u8, "c/d", inner[0].key);
+    try std.testing.expectEqualSlices(u8, "value", inner[0].value.table.items[0].value.string);
+}
+
+test "table: array of tables collects each element" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const text = "[[mesh]]\nid = \"a\"\n[[mesh]]\nid = \"b\"\n";
+    const tokens = try tokenization.tokenize(&arena, text);
+    const pairs = try parse(&arena, tokens);
+
+    try std.testing.expectEqual(1, pairs.len);
+    try std.testing.expectEqualSlices(u8, "mesh", pairs[0].key);
+
+    const meshes = pairs[0].value.array.items;
+    try std.testing.expectEqual(2, meshes.len);
+    try std.testing.expectEqualSlices(u8, "a", meshes[0].table.items[0].value.string);
+    try std.testing.expectEqualSlices(u8, "b", meshes[1].table.items[0].value.string);
+}
+
+test "table: sub table attaches to the last array element" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const text = "[[entity]]\n[entity.Transform]\nposition = [0, 1]\n[[entity]]\n[entity.Camera]\n";
+    const tokens = try tokenization.tokenize(&arena, text);
+    const pairs = try parse(&arena, tokens);
+
+    const entities = pairs[0].value.array.items;
+    try std.testing.expectEqual(2, entities.len);
+
+    try std.testing.expectEqualSlices(u8, "Transform", entities[0].table.items[0].key);
+    try std.testing.expectEqual(2, entities[0].table.items[0].value.table.items[0].value.array.items.len);
+
+    try std.testing.expectEqualSlices(u8, "Camera", entities[1].table.items[0].key);
+    try std.testing.expectEqual(0, entities[1].table.items[0].value.table.items.len);
+}
+
+test "table: rejects redefining a table as an array of tables" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const tokens = try tokenization.tokenize(&arena, "[a]\n[[a]]\n");
+    try std.testing.expectError(ParserError.TableRedefined, parse(&arena, tokens));
+}
+
+test "table: rejects redefining an array of tables as a table" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const tokens = try tokenization.tokenize(&arena, "[[a]]\n[a]\n");
+    try std.testing.expectError(ParserError.TableRedefined, parse(&arena, tokens));
+}
+
+test "table: rejects a header naming an existing value" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const tokens = try tokenization.tokenize(&arena, "a = 1\n[a]\n");
+    try std.testing.expectError(ParserError.TableRedefined, parse(&arena, tokens));
+}
+
+test "table: rejects a path through a value" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const tokens = try tokenization.tokenize(&arena, "a = 1\n[a.b]\n");
+    try std.testing.expectError(ParserError.NotATable, parse(&arena, tokens));
+}
+
+test "table: rejects a path through an empty array" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const tokens = try tokenization.tokenize(&arena, "a = []\n[a.b]\n");
+    try std.testing.expectError(ParserError.NotATable, parse(&arena, tokens));
+}
+
+test "table: rejects a path through an array of values" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const tokens = try tokenization.tokenize(&arena, "a = [1, 2]\n[a.b]\n");
+    try std.testing.expectError(ParserError.NotATable, parse(&arena, tokens));
+}
+
+test "key: parses a key and its value" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const text = "key = \"value\"";
+    const tokens = try tokenization.tokenize(&arena, text);
+    const pairs = try parse(&arena, tokens);
+
+    try std.testing.expectEqual(1, pairs.len);
+    try std.testing.expectEqualSlices(u8, "key", pairs[0].key);
+    try std.testing.expectEqualSlices(u8, "value", pairs[0].value.string);
+}
+
+test "key: accepts a quoted key" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const text = "\"engine/Transform\" = \"value\"\n";
+    const tokens = try tokenization.tokenize(&arena, text);
+    const pairs = try parse(&arena, tokens);
+
+    try std.testing.expectEqualSlices(u8, "engine/Transform", pairs[0].key);
+    try std.testing.expectEqualSlices(u8, "value", pairs[0].value.string);
+}
+
+test "key: rejects a key without equals" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const text = "key key key";
+    const tokens = try tokenization.tokenize(&arena, text);
+
+    try std.testing.expectError(ParserError.UnexpectedToken, parse(&arena, tokens));
+}
+
+test "key: rejects two assignments on one line" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const text = "key1 = \"value1\" key2 = \"value2\"";
+    const tokens = try tokenization.tokenize(&arena, text);
+
+    try std.testing.expectError(ParserError.UnexpectedToken, parse(&arena, tokens));
+}
+
+test "key: rejects a duplicate key" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const tokens = try tokenization.tokenize(&arena, "a = 1\na = 2\n");
+    try std.testing.expectError(ParserError.DuplicateKey, parse(&arena, tokens));
+}
+
+test "key: rejects a key colliding with an existing table" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const tokens = try tokenization.tokenize(&arena, "[a.b]\n[a]\nb = 1\n");
+    try std.testing.expectError(ParserError.DuplicateKey, parse(&arena, tokens));
+}
+
+test "value: parses integers and floats" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
     const text = "count = 5\nratio = 1.75\n";
+    const tokens = try tokenization.tokenize(&arena, text);
+    const pairs = try parse(&arena, tokens);
 
-    var token_container = try tokenization.tokenize(alloc, text);
-    defer token_container.deinit(alloc);
-
-    var container = try parse(alloc, token_container.tokens);
-    defer container.deinit(alloc);
-
-    try std.testing.expectEqual(2, container.key_value_pairs.len);
-    try std.testing.expectEqual(@as(i64, 5), container.key_value_pairs[0].value.integer);
-    try std.testing.expectEqual(@as(f64, 1.75), container.key_value_pairs[1].value.float);
+    try std.testing.expectEqual(2, pairs.len);
+    try std.testing.expectEqual(@as(i64, 5), pairs[0].value.integer);
+    try std.testing.expectEqual(@as(f64, 1.75), pairs[1].value.float);
 }
 
-test "Array" {
-    const alloc = std.testing.allocator;
+test "value: rejects a bare identifier" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const text = "key = not_a_string";
+    const tokens = try tokenization.tokenize(&arena, text);
+
+    try std.testing.expectError(ParserError.UnexpectedToken, parse(&arena, tokens));
+}
+
+test "array: parses mixed element types" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
     const text = "position = [0, 1.75, \"end\"]\n";
+    const tokens = try tokenization.tokenize(&arena, text);
+    const pairs = try parse(&arena, tokens);
 
-    var token_container = try tokenization.tokenize(alloc, text);
-    defer token_container.deinit(alloc);
-
-    var container = try parse(alloc, token_container.tokens);
-    defer container.deinit(alloc);
-
-    const array = container.key_value_pairs[0].value.array;
+    const array = pairs[0].value.array.items;
     try std.testing.expectEqual(3, array.len);
     try std.testing.expectEqual(@as(i64, 0), array[0].integer);
     try std.testing.expectEqual(@as(f64, 1.75), array[1].float);
     try std.testing.expectEqualSlices(u8, "end", array[2].string);
 }
 
-test "Empty array" {
-    const alloc = std.testing.allocator;
+test "array: parses an empty array" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
     const text = "items = []\n";
+    const tokens = try tokenization.tokenize(&arena, text);
+    const pairs = try parse(&arena, tokens);
 
-    var token_container = try tokenization.tokenize(alloc, text);
-    defer token_container.deinit(alloc);
-
-    var container = try parse(alloc, token_container.tokens);
-    defer container.deinit(alloc);
-
-    try std.testing.expectEqual(0, container.key_value_pairs[0].value.array.len);
+    try std.testing.expectEqual(0, pairs[0].value.array.items.len);
 }
 
-test "Nested array" {
-    const alloc = std.testing.allocator;
+test "array: parses nested arrays" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
     const text = "matrix = [[1, 2], [3, 4]]\n";
+    const tokens = try tokenization.tokenize(&arena, text);
+    const pairs = try parse(&arena, tokens);
 
-    var token_container = try tokenization.tokenize(alloc, text);
-    defer token_container.deinit(alloc);
-
-    var container = try parse(alloc, token_container.tokens);
-    defer container.deinit(alloc);
-
-    const matrix = container.key_value_pairs[0].value.array;
+    const matrix = pairs[0].value.array.items;
     try std.testing.expectEqual(2, matrix.len);
-    try std.testing.expectEqual(@as(i64, 2), matrix[0].array[1].integer);
-    try std.testing.expectEqual(@as(i64, 3), matrix[1].array[0].integer);
+    try std.testing.expectEqual(@as(i64, 2), matrix[0].array.items[1].integer);
+    try std.testing.expectEqual(@as(i64, 3), matrix[1].array.items[0].integer);
 }
 
-test "Unterminated array" {
-    const alloc = std.testing.allocator;
+test "array: rejects an unterminated array" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
     const text = "items = [1, 2\n";
+    const tokens = try tokenization.tokenize(&arena, text);
 
-    var token_container = try tokenization.tokenize(alloc, text);
-    defer token_container.deinit(alloc);
-
-    try std.testing.expectError(ParserError.UnexpectedToken, parse(alloc, token_container.tokens));
-}
-
-test "Dotted table header" {
-    const alloc = std.testing.allocator;
-    const text = "[server.tls]\nenabled = \"yes\"\n";
-
-    var token_container = try tokenization.tokenize(alloc, text);
-    defer token_container.deinit(alloc);
-
-    var container = try parse(alloc, token_container.tokens);
-    defer container.deinit(alloc);
-
-    try std.testing.expectEqual(1, container.key_value_pairs.len);
-    try std.testing.expectEqualSlices(u8, "server", container.key_value_pairs[0].key);
-
-    const server = container.key_value_pairs[0].value.table;
-    try std.testing.expectEqualSlices(u8, "tls", server[0].key);
-    try std.testing.expectEqualSlices(u8, "yes", server[0].value.table[0].value.string);
-}
-
-test "Quoted key" {
-    const alloc = std.testing.allocator;
-    const text = "\"engine/Transform\" = \"value\"\n";
-
-    var token_container = try tokenization.tokenize(alloc, text);
-    defer token_container.deinit(alloc);
-
-    var container = try parse(alloc, token_container.tokens);
-    defer container.deinit(alloc);
-
-    try std.testing.expectEqualSlices(u8, "engine/Transform", container.key_value_pairs[0].key);
-    try std.testing.expectEqualSlices(u8, "value", container.key_value_pairs[0].value.string);
-}
-
-test "Quoted table header segment" {
-    const alloc = std.testing.allocator;
-    const text = "[[entity]]\n[entity.\"engine/Transform\"]\nposition = [0, 1]\n";
-
-    var token_container = try tokenization.tokenize(alloc, text);
-    defer token_container.deinit(alloc);
-
-    var container = try parse(alloc, token_container.tokens);
-    defer container.deinit(alloc);
-
-    const entities = container.key_value_pairs[0].value.array;
-    try std.testing.expectEqual(1, entities.len);
-    try std.testing.expectEqualSlices(u8, "engine/Transform", entities[0].table[0].key);
-    try std.testing.expectEqual(2, entities[0].table[0].value.table[0].value.array.len);
-}
-
-test "Fully quoted table header" {
-    const alloc = std.testing.allocator;
-    const text = "[\"a/b\".\"c/d\"]\nkey = \"value\"\n";
-
-    var token_container = try tokenization.tokenize(alloc, text);
-    defer token_container.deinit(alloc);
-
-    var container = try parse(alloc, token_container.tokens);
-    defer container.deinit(alloc);
-
-    try std.testing.expectEqualSlices(u8, "a/b", container.key_value_pairs[0].key);
-
-    const inner = container.key_value_pairs[0].value.table;
-    try std.testing.expectEqualSlices(u8, "c/d", inner[0].key);
-    try std.testing.expectEqualSlices(u8, "value", inner[0].value.table[0].value.string);
-}
-
-test "Array of tables" {
-    const alloc = std.testing.allocator;
-    const text = "[[mesh]]\nid = \"a\"\n[[mesh]]\nid = \"b\"\n";
-
-    var token_container = try tokenization.tokenize(alloc, text);
-    defer token_container.deinit(alloc);
-
-    var container = try parse(alloc, token_container.tokens);
-    defer container.deinit(alloc);
-
-    try std.testing.expectEqual(1, container.key_value_pairs.len);
-    try std.testing.expectEqualSlices(u8, "mesh", container.key_value_pairs[0].key);
-
-    const meshes = container.key_value_pairs[0].value.array;
-    try std.testing.expectEqual(2, meshes.len);
-    try std.testing.expectEqualSlices(u8, "a", meshes[0].table[0].value.string);
-    try std.testing.expectEqualSlices(u8, "b", meshes[1].table[0].value.string);
-}
-
-test "Sub table of an array of tables" {
-    const alloc = std.testing.allocator;
-    const text = "[[entity]]\n[entity.Transform]\nposition = [0, 1]\n[[entity]]\n[entity.Camera]\n";
-
-    var token_container = try tokenization.tokenize(alloc, text);
-    defer token_container.deinit(alloc);
-
-    var container = try parse(alloc, token_container.tokens);
-    defer container.deinit(alloc);
-
-    const entities = container.key_value_pairs[0].value.array;
-    try std.testing.expectEqual(2, entities.len);
-
-    try std.testing.expectEqualSlices(u8, "Transform", entities[0].table[0].key);
-    try std.testing.expectEqual(2, entities[0].table[0].value.table[0].value.array.len);
-
-    try std.testing.expectEqualSlices(u8, "Camera", entities[1].table[0].key);
-    try std.testing.expectEqual(0, entities[1].table[0].value.table.len);
+    try std.testing.expectError(ParserError.UnexpectedToken, parse(&arena, tokens));
 }
