@@ -2,28 +2,30 @@ const std = @import("std");
 
 const tokenization = @import("tokenization.zig");
 const parsing = @import("parsing.zig");
+const mem = @import("mem.zig");
+
+const findPair = parsing.findPair;
+const KeyValuePair = parsing.KeyValuePair;
+const Value = parsing.Value;
 
 const TomlError = error{
     MissingField,
     TypeMismatch,
 };
 
-pub fn parse(comptime T: type, alloc: std.mem.Allocator, text: []const u8) !T {
-    var token_container = try tokenization.tokenize(alloc, text);
-    defer token_container.deinit(alloc);
+pub fn parseAlloc(allocator: std.mem.Allocator, comptime T: type, text: []const u8) !T {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
 
-    var parsed_data_container = try parsing.parse(alloc, token_container.tokens);
-    defer parsed_data_container.deinit(alloc);
+    const tokens = try tokenization.tokenize(&arena, text);
+    const pairs = try parsing.parse(&arena, tokens);
 
-    return fillValue(T, alloc, .{ .table = parsed_data_container.key_value_pairs });
+    return fromValue(allocator, T, .{
+        .table = std.ArrayList(KeyValuePair).fromOwnedSlice(pairs),
+    });
 }
 
-fn fillValue(comptime T: type, alloc: std.mem.Allocator, value: parsing.Value) !T {
-    if (T == []const u8) {
-        if (value != .string) return TomlError.TypeMismatch;
-        return alloc.dupe(u8, value.string);
-    }
-
+fn fromValue(allocator: std.mem.Allocator, comptime T: type, value: Value) !T {
     switch (@typeInfo(T)) {
         .int => {
             if (value != .integer) return TomlError.TypeMismatch;
@@ -34,7 +36,7 @@ fn fillValue(comptime T: type, alloc: std.mem.Allocator, value: parsing.Value) !
             .float => |float| return @floatCast(float),
             else => return TomlError.TypeMismatch,
         },
-        .optional => |info| return try fillValue(info.child, alloc, value),
+        .optional => |info| return try fromValue(allocator, info.child, value),
         .@"struct" => |info| {
             if (value != .table) return TomlError.TypeMismatch;
 
@@ -42,18 +44,20 @@ fn fillValue(comptime T: type, alloc: std.mem.Allocator, value: parsing.Value) !
             var filled: usize = 0;
 
             errdefer inline for (info.fields, 0..) |field, i| {
-                if (i < filled) deinit(field.type, alloc, @field(result, field.name));
+                if (!field.is_comptime and i < filled) mem.deinit(allocator, field.type, @field(result, field.name));
             };
 
             inline for (info.fields, 0..) |field, i| {
-                if (findPair(value.table, field.name)) |pair| {
-                    @field(result, field.name) = try fillValue(field.type, alloc, pair.value);
-                } else if (field.defaultValue()) |default| {
-                    @field(result, field.name) = try dupeValue(field.type, alloc, default);
-                } else if (@typeInfo(field.type) == .optional) {
-                    @field(result, field.name) = null;
-                } else {
-                    return TomlError.MissingField;
+                if (!field.is_comptime) {
+                    if (findPair(value.table.items, field.name)) |pair| {
+                        @field(result, field.name) = try fromValue(allocator, field.type, pair.value);
+                    } else if (field.defaultValue()) |default| {
+                        @field(result, field.name) = try mem.dupe(allocator, field.type, default);
+                    } else if (@typeInfo(field.type) == .optional) {
+                        @field(result, field.name) = null;
+                    } else {
+                        return TomlError.MissingField;
+                    }
                 }
 
                 filled = i + 1;
@@ -63,174 +67,79 @@ fn fillValue(comptime T: type, alloc: std.mem.Allocator, value: parsing.Value) !
         },
         .array => |info| {
             if (value != .array) return TomlError.TypeMismatch;
-            if (value.array.len != info.len) return TomlError.TypeMismatch;
+            if (value.array.items.len != info.len) return TomlError.TypeMismatch;
 
             var result: T = undefined;
             var filled: usize = 0;
 
-            errdefer for (result[0..filled]) |item| deinit(info.child, alloc, item);
+            errdefer for (result[0..filled]) |item| mem.deinit(allocator, info.child, item);
 
-            for (value.array, 0..) |item, i| {
-                result[i] = try fillValue(info.child, alloc, item);
+            for (value.array.items, 0..) |item, i| {
+                result[i] = try fromValue(allocator, info.child, item);
                 filled = i + 1;
             }
+
+            if (comptime info.sentinel()) |sentinel| result[info.len] = sentinel;
 
             return result;
         },
         .pointer => |info| {
             if (info.size != .slice) return TomlError.TypeMismatch;
-            if (value != .array) return TomlError.TypeMismatch;
 
-            const result = try alloc.alloc(info.child, value.array.len);
-            var filled: usize = 0;
+            switch (value) {
+                .string => |string| {
+                    if (info.child != u8) return TomlError.TypeMismatch;
 
-            errdefer {
-                for (result[0..filled]) |item| deinit(info.child, alloc, item);
-                alloc.free(result);
+                    if (comptime info.sentinel()) |sentinel| {
+                        const result = try allocator.allocSentinel(u8, string.len, sentinel);
+                        @memcpy(result, string);
+                        return result;
+                    }
+
+                    return allocator.dupe(u8, string);
+                },
+                .array => |array| {
+                    const result = if (comptime info.sentinel()) |sentinel|
+                        try allocator.allocSentinel(info.child, array.items.len, sentinel)
+                    else
+                        try allocator.alloc(info.child, array.items.len);
+
+                    var filled: usize = 0;
+
+                    errdefer {
+                        for (result[0..filled]) |item| mem.deinit(allocator, info.child, item);
+                        allocator.free(result);
+                    }
+
+                    for (array.items, 0..) |item, i| {
+                        result[i] = try fromValue(allocator, info.child, item);
+                        filled = i + 1;
+                    }
+
+                    return result;
+                },
+                else => return TomlError.TypeMismatch,
             }
-
-            for (value.array, 0..) |item, i| {
-                result[i] = try fillValue(info.child, alloc, item);
-                filled = i + 1;
-            }
-
-            return result;
         },
         else => return TomlError.TypeMismatch,
     }
 }
 
-fn findPair(pairs: []const parsing.KeyValuePair, key: []const u8) ?*const parsing.KeyValuePair {
-    for (pairs) |*pair| {
-        if (std.mem.eql(u8, pair.key, key)) return pair;
-    }
-    return null;
-}
-
-fn dupeValue(comptime T: type, alloc: std.mem.Allocator, value: T) !T {
-    if (T == []const u8) return alloc.dupe(u8, value);
-
-    switch (@typeInfo(T)) {
-        .optional => |info| {
-            if (value) |inner| return try dupeValue(info.child, alloc, inner);
-            return null;
-        },
-        .@"struct" => |info| {
-            var result: T = undefined;
-            var filled: usize = 0;
-
-            errdefer inline for (info.fields, 0..) |field, i| {
-                if (i < filled) deinit(field.type, alloc, @field(result, field.name));
-            };
-
-            inline for (info.fields, 0..) |field, i| {
-                @field(result, field.name) = try dupeValue(field.type, alloc, @field(value, field.name));
-                filled = i + 1;
-            }
-
-            return result;
-        },
-        .array => |info| {
-            var result: T = undefined;
-            var filled: usize = 0;
-
-            errdefer for (result[0..filled]) |item| deinit(info.child, alloc, item);
-
-            for (value, 0..) |item, i| {
-                result[i] = try dupeValue(info.child, alloc, item);
-                filled = i + 1;
-            }
-
-            return result;
-        },
-        .pointer => |info| {
-            if (info.size != .slice) return value;
-
-            const result = try alloc.alloc(info.child, value.len);
-            var filled: usize = 0;
-
-            errdefer {
-                for (result[0..filled]) |item| deinit(info.child, alloc, item);
-                alloc.free(result);
-            }
-
-            for (value, 0..) |item, i| {
-                result[i] = try dupeValue(info.child, alloc, item);
-                filled = i + 1;
-            }
-
-            return result;
-        },
-        else => return value,
-    }
-}
-
-pub fn deinit(comptime T: type, alloc: std.mem.Allocator, value: T) void {
-    if (T == []const u8) return alloc.free(value);
-
-    switch (@typeInfo(T)) {
-        .optional => |info| {
-            if (value) |inner| deinit(info.child, alloc, inner);
-        },
-        .@"struct" => |info| inline for (info.fields) |field| {
-            deinit(field.type, alloc, @field(value, field.name));
-        },
-        .array => |info| for (value) |item| deinit(info.child, alloc, item),
-        .pointer => |info| {
-            if (info.size != .slice) return;
-
-            for (value) |item| deinit(info.child, alloc, item);
-            alloc.free(value);
-        },
-        else => {},
-    }
-}
-
-test "Parse into struct" {
-    const alloc = std.testing.allocator;
-    const text = "name = \"toml\"";
+test "int: fills an integer field" {
+    const allocator = std.testing.allocator;
+    const text = "count = 5\n";
 
     const Config = struct {
-        name: []const u8,
+        count: u32,
     };
 
-    const result = try parse(Config, alloc, text);
-    defer alloc.free(result.name);
+    const result = try parseAlloc(allocator, Config, text);
 
-    try std.testing.expectEqualSlices(u8, "toml", result.name);
+    try std.testing.expectEqual(@as(u32, 5), result.count);
 }
 
-test "Missing field uses default" {
-    const alloc = std.testing.allocator;
-    const text = "name = \"toml\"";
-
-    const Config = struct {
-        name: []const u8,
-        version: []const u8 = "unknown",
-    };
-
-    const result = try parse(Config, alloc, text);
-    defer alloc.free(result.name);
-    defer alloc.free(result.version);
-
-    try std.testing.expectEqualSlices(u8, "toml", result.name);
-    try std.testing.expectEqualSlices(u8, "unknown", result.version);
-}
-
-test "Missing field without default returns error" {
-    const alloc = std.testing.allocator;
-    const text = "name = \"toml\"";
-
-    const Config = struct {
-        name: []const u8,
-        version: []const u8,
-    };
-
-    try std.testing.expectError(TomlError.MissingField, parse(Config, alloc, text));
-}
-
-test "Type mismatch returns error" {
-    const alloc = std.testing.allocator;
+test "int: rejects a string value" {
+    const allocator = std.testing.allocator;
     const text = "name = \"toml\"\ncount = \"5\"";
 
     const Config = struct {
@@ -238,117 +147,91 @@ test "Type mismatch returns error" {
         count: u32,
     };
 
-    try std.testing.expectError(TomlError.TypeMismatch, parse(Config, alloc, text));
+    try std.testing.expectError(TomlError.TypeMismatch, parseAlloc(allocator, Config, text));
 }
 
-test "Nested table fills nested struct" {
-    const alloc = std.testing.allocator;
-    const text = "name = \"toml\"\n[server]\nhost = \"localhost\"\n";
-
-    const Server = struct {
-        host: []const u8,
-    };
-    const Config = struct {
-        name: []const u8,
-        server: Server,
-    };
-
-    const result = try parse(Config, alloc, text);
-    defer deinit(Config, alloc, result);
-
-    try std.testing.expectEqualSlices(u8, "toml", result.name);
-    try std.testing.expectEqualSlices(u8, "localhost", result.server.host);
-}
-
-test "Missing table uses struct default" {
-    const alloc = std.testing.allocator;
-    const text = "name = \"toml\"";
-
-    const Server = struct {
-        host: []const u8,
-    };
-    const Config = struct {
-        name: []const u8,
-        server: Server = .{ .host = "localhost" },
-    };
-
-    const result = try parse(Config, alloc, text);
-    defer deinit(Config, alloc, result);
-
-    try std.testing.expectEqualSlices(u8, "toml", result.name);
-    try std.testing.expectEqualSlices(u8, "localhost", result.server.host);
-}
-
-test "Numbers fill numeric fields" {
-    const alloc = std.testing.allocator;
-    const text = "count = 5\nratio = 1.75\nscale = 2\n";
-
-    const Config = struct {
-        count: u32,
-        ratio: f32,
-        scale: f64,
-    };
-
-    const result = try parse(Config, alloc, text);
-
-    try std.testing.expectEqual(@as(u32, 5), result.count);
-    try std.testing.expectEqual(@as(f32, 1.75), result.ratio);
-    try std.testing.expectEqual(@as(f64, 2), result.scale);
-}
-
-test "Number out of range returns error" {
-    const alloc = std.testing.allocator;
+test "int: rejects a value out of range" {
+    const allocator = std.testing.allocator;
     const text = "count = -1\n";
 
     const Config = struct {
         count: u32,
     };
 
-    try std.testing.expectError(TomlError.TypeMismatch, parse(Config, alloc, text));
+    try std.testing.expectError(TomlError.TypeMismatch, parseAlloc(allocator, Config, text));
 }
 
-test "Array fills a fixed size array" {
-    const alloc = std.testing.allocator;
-    const text = "position = [0, 1.75, 0, 1]\n";
+test "float: fills a float field" {
+    const allocator = std.testing.allocator;
+    const text = "ratio = 1.75\n";
 
     const Config = struct {
-        position: [4]f32,
+        ratio: f32,
     };
 
-    const result = try parse(Config, alloc, text);
+    const result = try parseAlloc(allocator, Config, text);
 
-    try std.testing.expectEqual([4]f32{ 0, 1.75, 0, 1 }, result.position);
+    try std.testing.expectEqual(@as(f32, 1.75), result.ratio);
 }
 
-test "Array of the wrong length returns error" {
-    const alloc = std.testing.allocator;
-    const text = "position = [0, 1]\n";
+test "float: accepts an integer value" {
+    const allocator = std.testing.allocator;
+    const text = "scale = 2\n";
 
     const Config = struct {
-        position: [4]f32,
+        scale: f64,
     };
 
-    try std.testing.expectError(TomlError.TypeMismatch, parse(Config, alloc, text));
+    const result = try parseAlloc(allocator, Config, text);
+
+    try std.testing.expectEqual(@as(f64, 2), result.scale);
 }
 
-test "Array fills a slice" {
-    const alloc = std.testing.allocator;
-    const text = "names = [\"a\", \"b\"]\n";
+test "float: rejects a string value" {
+    const allocator = std.testing.allocator;
+    const text = "ratio = \"1.75\"\n";
 
     const Config = struct {
-        names: [][]const u8,
+        ratio: f32,
     };
 
-    const result = try parse(Config, alloc, text);
-    defer deinit(Config, alloc, result);
-
-    try std.testing.expectEqual(2, result.names.len);
-    try std.testing.expectEqualSlices(u8, "a", result.names[0]);
-    try std.testing.expectEqualSlices(u8, "b", result.names[1]);
+    try std.testing.expectError(TomlError.TypeMismatch, parseAlloc(allocator, Config, text));
 }
 
-test "Missing optional field becomes null" {
-    const alloc = std.testing.allocator;
+test "optional: fills a present value" {
+    const allocator = std.testing.allocator;
+    const text = "[server]\nhost = \"localhost\"\n";
+
+    const Server = struct {
+        host: []const u8,
+    };
+    const Config = struct {
+        server: ?Server,
+    };
+
+    const result = try parseAlloc(allocator, Config, text);
+    defer mem.deinit(allocator, Config, result);
+
+    try std.testing.expectEqualSlices(u8, "localhost", result.server.?.host);
+}
+
+test "optional: uses the default of a missing field" {
+    const allocator = std.testing.allocator;
+    const text = "name = \"toml\"\n";
+
+    const Config = struct {
+        name: []const u8,
+        port: ?u16 = 8080,
+    };
+
+    const result = try parseAlloc(allocator, Config, text);
+    defer mem.deinit(allocator, Config, result);
+
+    try std.testing.expectEqual(@as(?u16, 8080), result.port);
+}
+
+test "optional: missing field becomes null" {
+    const allocator = std.testing.allocator;
     const text = "name = \"toml\"";
 
     const Server = struct {
@@ -359,65 +242,84 @@ test "Missing optional field becomes null" {
         server: ?Server,
     };
 
-    const result = try parse(Config, alloc, text);
-    defer deinit(Config, alloc, result);
+    const result = try parseAlloc(allocator, Config, text);
+    defer mem.deinit(allocator, Config, result);
 
     try std.testing.expectEqualSlices(u8, "toml", result.name);
     try std.testing.expectEqual(null, result.server);
 }
 
-test "Array of tables fills a slice of structs" {
-    const alloc = std.testing.allocator;
-    const text = "[[mesh]]\nid = \"floor\"\n[[mesh]]\nid = \"wall\"\n";
+test "optional: rejects a present value of the wrong type" {
+    const allocator = std.testing.allocator;
+    const text = "server = 5\n";
 
-    const Mesh = struct {
-        id: []const u8,
+    const Server = struct {
+        host: []const u8,
     };
     const Config = struct {
-        mesh: []Mesh,
+        server: ?Server,
     };
 
-    const result = try parse(Config, alloc, text);
-    defer deinit(Config, alloc, result);
-
-    try std.testing.expectEqual(2, result.mesh.len);
-    try std.testing.expectEqualSlices(u8, "floor", result.mesh[0].id);
-    try std.testing.expectEqualSlices(u8, "wall", result.mesh[1].id);
+    try std.testing.expectError(TomlError.TypeMismatch, parseAlloc(allocator, Config, text));
 }
 
-test "Omitted fields use defaults inside an array of tables" {
-    const alloc = std.testing.allocator;
-    const text = "[[mesh]]\nid = \"floor\"\n[[mesh]]\nid = \"wall\"\npath = \"assets/wall.obj\"\nscale = 2.5\n";
+test "struct: fills a nested struct from a table" {
+    const allocator = std.testing.allocator;
+    const text = "name = \"toml\"\n[server]\nhost = \"localhost\"\n";
 
-    const Mesh = struct {
-        id: []const u8,
-        path: []const u8 = "assets/default.obj",
-        scale: f32 = 1.0,
-        tint: [4]f32 = .{ 1, 1, 1, 1 },
-        tags: [][]const u8 = &.{},
+    const Server = struct {
+        host: []const u8,
     };
-    const Level = struct {
-        mesh: []Mesh,
-        name: []const u8 = "untitled",
+    const Config = struct {
+        name: []const u8,
+        server: Server,
     };
 
-    const result = try parse(Level, alloc, text);
-    defer deinit(Level, alloc, result);
+    const result = try parseAlloc(allocator, Config, text);
+    defer mem.deinit(allocator, Config, result);
 
-    try std.testing.expectEqualSlices(u8, "untitled", result.name);
-    try std.testing.expectEqual(2, result.mesh.len);
-
-    try std.testing.expectEqualSlices(u8, "assets/default.obj", result.mesh[0].path);
-    try std.testing.expectEqual(@as(f32, 1.0), result.mesh[0].scale);
-    try std.testing.expectEqual([4]f32{ 1, 1, 1, 1 }, result.mesh[0].tint);
-    try std.testing.expectEqual(0, result.mesh[0].tags.len);
-
-    try std.testing.expectEqualSlices(u8, "assets/wall.obj", result.mesh[1].path);
-    try std.testing.expectEqual(@as(f32, 2.5), result.mesh[1].scale);
+    try std.testing.expectEqualSlices(u8, "toml", result.name);
+    try std.testing.expectEqualSlices(u8, "localhost", result.server.host);
 }
 
-test "Omitted fields use defaults inside a nested table" {
-    const alloc = std.testing.allocator;
+test "struct: uses the default of a missing field" {
+    const allocator = std.testing.allocator;
+    const text = "name = \"toml\"";
+
+    const Config = struct {
+        name: []const u8,
+        version: []const u8 = "unknown",
+    };
+
+    const result = try parseAlloc(allocator, Config, text);
+    defer allocator.free(result.name);
+    defer allocator.free(result.version);
+
+    try std.testing.expectEqualSlices(u8, "toml", result.name);
+    try std.testing.expectEqualSlices(u8, "unknown", result.version);
+}
+
+test "struct: uses a struct default for a missing table" {
+    const allocator = std.testing.allocator;
+    const text = "name = \"toml\"";
+
+    const Server = struct {
+        host: []const u8,
+    };
+    const Config = struct {
+        name: []const u8,
+        server: Server = .{ .host = "localhost" },
+    };
+
+    const result = try parseAlloc(allocator, Config, text);
+    defer mem.deinit(allocator, Config, result);
+
+    try std.testing.expectEqualSlices(u8, "toml", result.name);
+    try std.testing.expectEqualSlices(u8, "localhost", result.server.host);
+}
+
+test "struct: uses defaults inside a nested table" {
+    const allocator = std.testing.allocator;
     const text = "[server]\nhost = \"localhost\"\n";
 
     const Tls = struct {
@@ -432,16 +334,47 @@ test "Omitted fields use defaults inside a nested table" {
         server: Server,
     };
 
-    const result = try parse(Config, alloc, text);
-    defer deinit(Config, alloc, result);
+    const result = try parseAlloc(allocator, Config, text);
+    defer mem.deinit(allocator, Config, result);
 
     try std.testing.expectEqualSlices(u8, "localhost", result.server.host);
     try std.testing.expectEqual(@as(u16, 8080), result.server.port);
     try std.testing.expectEqualSlices(u8, "none", result.server.tls.cert);
 }
 
-test "Quoted keys fill quoted field names" {
-    const alloc = std.testing.allocator;
+test "struct: uses defaults inside an array of tables" {
+    const allocator = std.testing.allocator;
+    const text = "[[mesh]]\nid = \"floor\"\n[[mesh]]\nid = \"wall\"\npath = \"assets/wall.obj\"\nscale = 2.5\n";
+
+    const Mesh = struct {
+        id: []const u8,
+        path: []const u8 = "assets/default.obj",
+        scale: f32 = 1.0,
+        tint: [4]f32 = .{ 1, 1, 1, 1 },
+        tags: [][]const u8 = &.{},
+    };
+    const Level = struct {
+        mesh: []Mesh,
+        name: []const u8 = "untitled",
+    };
+
+    const result = try parseAlloc(allocator, Level, text);
+    defer mem.deinit(allocator, Level, result);
+
+    try std.testing.expectEqualSlices(u8, "untitled", result.name);
+    try std.testing.expectEqual(2, result.mesh.len);
+
+    try std.testing.expectEqualSlices(u8, "assets/default.obj", result.mesh[0].path);
+    try std.testing.expectEqual(@as(f32, 1.0), result.mesh[0].scale);
+    try std.testing.expectEqual([4]f32{ 1, 1, 1, 1 }, result.mesh[0].tint);
+    try std.testing.expectEqual(0, result.mesh[0].tags.len);
+
+    try std.testing.expectEqualSlices(u8, "assets/wall.obj", result.mesh[1].path);
+    try std.testing.expectEqual(@as(f32, 2.5), result.mesh[1].scale);
+}
+
+test "struct: matches a quoted key to a quoted field name" {
+    const allocator = std.testing.allocator;
     const text =
         \\[[entity]]
         \\    [entity."engine/Transform"]
@@ -465,8 +398,8 @@ test "Quoted keys fill quoted field names" {
         entity: []Entity,
     };
 
-    const result = try parse(Level, alloc, text);
-    defer deinit(Level, alloc, result);
+    const result = try parseAlloc(allocator, Level, text);
+    defer mem.deinit(allocator, Level, result);
 
     try std.testing.expectEqual(1, result.entity.len);
     try std.testing.expectEqual(
@@ -476,8 +409,252 @@ test "Quoted keys fill quoted field names" {
     try std.testing.expectEqual(@as(u32, 100), result.entity[0].@"game/Health".?.@"max value");
 }
 
-test "Level file" {
-    const alloc = std.testing.allocator;
+test "struct: keeps comptime fields at their declared value" {
+    const allocator = std.testing.allocator;
+    const text = "name = \"toml\"\nkind = \"ignored\"\n";
+
+    const Config = struct {
+        comptime kind: []const u8 = "static",
+        name: []const u8,
+    };
+
+    const result = try parseAlloc(allocator, Config, text);
+    defer mem.deinit(allocator, Config, result);
+
+    try std.testing.expectEqualSlices(u8, "static", result.kind);
+    try std.testing.expectEqualSlices(u8, "toml", result.name);
+}
+
+test "struct: rejects a non table value" {
+    const allocator = std.testing.allocator;
+    const text = "server = 5\n";
+
+    const Server = struct {
+        host: []const u8,
+    };
+    const Config = struct {
+        server: Server,
+    };
+
+    try std.testing.expectError(TomlError.TypeMismatch, parseAlloc(allocator, Config, text));
+}
+
+test "struct: rejects a missing field without a default" {
+    const allocator = std.testing.allocator;
+    const text = "name = \"toml\"";
+
+    const Config = struct {
+        name: []const u8,
+        version: []const u8,
+    };
+
+    try std.testing.expectError(TomlError.MissingField, parseAlloc(allocator, Config, text));
+}
+
+test "struct: rejects a nested table missing a required field" {
+    const allocator = std.testing.allocator;
+    const text = "name = \"toml\"\n[server]\nport = \"8080\"\n";
+
+    const Server = struct {
+        host: []const u8,
+    };
+    const Config = struct {
+        name: []const u8,
+        server: Server,
+    };
+
+    try std.testing.expectError(TomlError.MissingField, parseAlloc(allocator, Config, text));
+}
+
+test "array: fills a fixed size array" {
+    const allocator = std.testing.allocator;
+    const text = "position = [0, 1.75, 0, 1]\n";
+
+    const Config = struct {
+        position: [4]f32,
+    };
+
+    const result = try parseAlloc(allocator, Config, text);
+
+    try std.testing.expectEqual([4]f32{ 0, 1.75, 0, 1 }, result.position);
+}
+
+test "array: fills a sentinel terminated array" {
+    const allocator = std.testing.allocator;
+    const text = "values = [1, 2, 3]\n";
+
+    const Config = struct {
+        values: [3:0]i64,
+    };
+
+    const result = try parseAlloc(allocator, Config, text);
+    defer mem.deinit(allocator, Config, result);
+
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3 }, &result.values);
+    try std.testing.expectEqual(0, result.values[result.values.len]);
+}
+
+test "array: rejects a non array value" {
+    const allocator = std.testing.allocator;
+    const text = "position = \"origin\"\n";
+
+    const Config = struct {
+        position: [4]f32,
+    };
+
+    try std.testing.expectError(TomlError.TypeMismatch, parseAlloc(allocator, Config, text));
+}
+
+test "array: rejects an array of the wrong length" {
+    const allocator = std.testing.allocator;
+    const text = "position = [0, 1]\n";
+
+    const Config = struct {
+        position: [4]f32,
+    };
+
+    try std.testing.expectError(TomlError.TypeMismatch, parseAlloc(allocator, Config, text));
+}
+
+test "array: frees filled elements when an element fails" {
+    const allocator = std.testing.allocator;
+    const text = "names = [\"a\", 5]\n";
+
+    const Config = struct {
+        names: [2][]const u8,
+    };
+
+    try std.testing.expectError(TomlError.TypeMismatch, parseAlloc(allocator, Config, text));
+}
+
+test "slice: fills a string field" {
+    const allocator = std.testing.allocator;
+    const text = "name = \"toml\"";
+
+    const Config = struct {
+        name: []const u8,
+    };
+
+    const result = try parseAlloc(allocator, Config, text);
+    defer allocator.free(result.name);
+
+    try std.testing.expectEqualSlices(u8, "toml", result.name);
+}
+
+test "slice: fills a slice of strings" {
+    const allocator = std.testing.allocator;
+    const text = "names = [\"a\", \"b\"]\n";
+
+    const Config = struct {
+        names: [][]const u8,
+    };
+
+    const result = try parseAlloc(allocator, Config, text);
+    defer mem.deinit(allocator, Config, result);
+
+    try std.testing.expectEqual(2, result.names.len);
+    try std.testing.expectEqualSlices(u8, "a", result.names[0]);
+    try std.testing.expectEqualSlices(u8, "b", result.names[1]);
+}
+
+test "slice: fills a slice of structs from an array of tables" {
+    const allocator = std.testing.allocator;
+    const text = "[[mesh]]\nid = \"floor\"\n[[mesh]]\nid = \"wall\"\n";
+
+    const Mesh = struct {
+        id: []const u8,
+    };
+    const Config = struct {
+        mesh: []Mesh,
+    };
+
+    const result = try parseAlloc(allocator, Config, text);
+    defer mem.deinit(allocator, Config, result);
+
+    try std.testing.expectEqual(2, result.mesh.len);
+    try std.testing.expectEqualSlices(u8, "floor", result.mesh[0].id);
+    try std.testing.expectEqualSlices(u8, "wall", result.mesh[1].id);
+}
+
+test "slice: fills an empty slice from an empty array" {
+    const allocator = std.testing.allocator;
+    const text = "names = []\n";
+
+    const Config = struct {
+        names: [][]const u8,
+    };
+
+    const result = try parseAlloc(allocator, Config, text);
+    defer mem.deinit(allocator, Config, result);
+
+    try std.testing.expectEqual(0, result.names.len);
+}
+
+test "slice: fills a sentinel terminated string field" {
+    const allocator = std.testing.allocator;
+    const text = "name = \"toml\"\n";
+
+    const Config = struct {
+        name: [:0]const u8,
+    };
+
+    const result = try parseAlloc(allocator, Config, text);
+    defer mem.deinit(allocator, Config, result);
+
+    try std.testing.expectEqualSlices(u8, "toml", result.name);
+    try std.testing.expectEqual(0, result.name[result.name.len]);
+}
+
+test "slice: fills a sentinel terminated slice" {
+    const allocator = std.testing.allocator;
+    const text = "values = [1, 2, 3]\n";
+
+    const Config = struct {
+        values: [:0]const i64,
+    };
+
+    const result = try parseAlloc(allocator, Config, text);
+    defer mem.deinit(allocator, Config, result);
+
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3 }, result.values);
+    try std.testing.expectEqual(0, result.values[result.values.len]);
+}
+
+test "slice: rejects a string for a non byte slice" {
+    const allocator = std.testing.allocator;
+    const text = "ratios = \"1.75\"\n";
+
+    const Config = struct {
+        ratios: []f32,
+    };
+
+    try std.testing.expectError(TomlError.TypeMismatch, parseAlloc(allocator, Config, text));
+}
+
+test "slice: rejects a non array value" {
+    const allocator = std.testing.allocator;
+    const text = "names = 5\n";
+
+    const Config = struct {
+        names: [][]const u8,
+    };
+
+    try std.testing.expectError(TomlError.TypeMismatch, parseAlloc(allocator, Config, text));
+}
+
+test "slice: frees filled elements when an element fails" {
+    const allocator = std.testing.allocator;
+    const text = "names = [\"a\", 5]\n";
+
+    const Config = struct {
+        names: [][]const u8,
+    };
+
+    try std.testing.expectError(TomlError.TypeMismatch, parseAlloc(allocator, Config, text));
+}
+
+test "parse: fills a level document" {
+    const allocator = std.testing.allocator;
     const text =
         \\[[mesh]]
         \\id = "floor"
@@ -520,8 +697,8 @@ test "Level file" {
         entity: []Entity,
     };
 
-    const result = try parse(Level, alloc, text);
-    defer deinit(Level, alloc, result);
+    const result = try parseAlloc(allocator, Level, text);
+    defer mem.deinit(allocator, Level, result);
 
     try std.testing.expectEqual(1, result.mesh.len);
     try std.testing.expectEqualSlices(u8, "floor", result.mesh[0].id);
@@ -538,19 +715,4 @@ test "Level file" {
     try std.testing.expectEqual(null, result.entity[1].Mesh);
     try std.testing.expect(result.entity[1].Camera != null);
     try std.testing.expect(result.entity[1].Active != null);
-}
-
-test "Table with missing required field returns error" {
-    const alloc = std.testing.allocator;
-    const text = "name = \"toml\"\n[server]\nport = \"8080\"\n";
-
-    const Server = struct {
-        host: []const u8,
-    };
-    const Config = struct {
-        name: []const u8,
-        server: Server,
-    };
-
-    try std.testing.expectError(TomlError.MissingField, parse(Config, alloc, text));
 }

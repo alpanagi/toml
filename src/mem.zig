@@ -47,6 +47,8 @@ pub fn dupe(allocator: std.mem.Allocator, comptime T: type, value: T) std.mem.Al
                 filled = i + 1;
             }
 
+            if (comptime info.sentinel()) |sentinel| result[info.len] = sentinel;
+
             return result;
         },
         .pointer => |info| switch (info.size) {
@@ -194,6 +196,18 @@ test "dupe: copies array elements" {
     try std.testing.expectEqualSlices(u8, "first", copy[0]);
     try std.testing.expectEqualSlices(u8, "second", copy[1]);
     try std.testing.expect(copy[0].ptr != original[0].ptr);
+}
+
+test "dupe: copies a sentinel terminated array" {
+    const allocator = std.testing.allocator;
+
+    const original: [3:0]u8 = .{ 1, 2, 3 };
+
+    const copy = try dupe(allocator, [3:0]u8, original);
+    defer deinit(allocator, [3:0]u8, copy);
+
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, &copy);
+    try std.testing.expectEqual(0, copy[copy.len]);
 }
 
 test "dupe: copies a slice and its elements" {
