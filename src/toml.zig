@@ -5,10 +5,11 @@ const parsing = @import("parsing.zig");
 const mem = @import("mem.zig");
 
 const findPair = parsing.findPair;
-const KeyValuePair = parsing.KeyValuePair;
-const Value = parsing.Value;
 
-const TomlError = error{
+pub const KeyValuePair = parsing.KeyValuePair;
+pub const Value = parsing.Value;
+
+pub const TomlError = error{
     MissingField,
     TypeMismatch,
 };
@@ -25,7 +26,14 @@ pub fn parseAlloc(allocator: std.mem.Allocator, comptime T: type, text: []const 
     });
 }
 
-fn fromValue(allocator: std.mem.Allocator, comptime T: type, value: Value) !T {
+pub fn parseRaw(arena: *std.heap.ArenaAllocator, text: []const u8) !Value {
+    const tokens = try tokenization.tokenize(arena, text);
+    const pairs = try parsing.parse(arena, tokens);
+
+    return .{ .table = std.ArrayList(KeyValuePair).fromOwnedSlice(pairs) };
+}
+
+pub fn fromValue(allocator: std.mem.Allocator, comptime T: type, value: Value) !T {
     switch (@typeInfo(T)) {
         .int => {
             if (value != .integer) return TomlError.TypeMismatch;
@@ -653,7 +661,7 @@ test "slice: frees filled elements when an element fails" {
     try std.testing.expectError(TomlError.TypeMismatch, parseAlloc(allocator, Config, text));
 }
 
-test "parse: fills a level document" {
+test "parseAlloc: parses a document" {
     const allocator = std.testing.allocator;
     const text =
         \\[[mesh]]
@@ -715,4 +723,55 @@ test "parse: fills a level document" {
     try std.testing.expectEqual(null, result.entity[1].Mesh);
     try std.testing.expect(result.entity[1].Camera != null);
     try std.testing.expect(result.entity[1].Active != null);
+}
+
+test "parseRaw: returns the root as a table" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const root = try parseRaw(&arena, "name = \"toml\"\ncount = 5\n");
+
+    try std.testing.expectEqual(2, root.table.items.len);
+    try std.testing.expectEqualSlices(u8, "toml", findPair(root.table.items, "name").?.value.string);
+    try std.testing.expectEqual(5, findPair(root.table.items, "count").?.value.integer);
+}
+
+test "parseRaw: keeps nested tables and arrays" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const text = "[server]\nhost = \"localhost\"\nports = [80, 443]\n";
+    const root = try parseRaw(&arena, text);
+
+    const server = findPair(root.table.items, "server").?.value;
+    try std.testing.expectEqualSlices(u8, "localhost", findPair(server.table.items, "host").?.value.string);
+
+    const ports = findPair(server.table.items, "ports").?.value.array.items;
+    try std.testing.expectEqual(2, ports.len);
+    try std.testing.expectEqual(443, ports[1].integer);
+}
+
+test "parseRaw: fills a type from a value the caller selects" {
+    const allocator = std.testing.allocator;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const text =
+        \\[[entity]]
+        \\    [entity.Transform]
+        \\    position = [0,1.75,0,1]
+        \\
+    ;
+
+    const Transform = struct { position: [4]f32 };
+
+    const root = try parseRaw(&arena, text);
+    const entities = findPair(root.table.items, "entity").?.value.array.items;
+    const component = findPair(entities[0].table.items, "Transform").?;
+
+    const transform = try fromValue(allocator, Transform, component.value);
+    defer mem.deinit(allocator, Transform, transform);
+
+    try std.testing.expectEqual([4]f32{ 0, 1.75, 0, 1 }, transform.position);
 }
