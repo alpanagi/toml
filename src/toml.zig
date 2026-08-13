@@ -4,8 +4,7 @@ const tokenization = @import("tokenization.zig");
 const parsing = @import("parsing.zig");
 const mem = @import("mem.zig");
 
-const findPair = parsing.findPair;
-
+pub const findPair = parsing.findPair;
 pub const KeyValuePair = parsing.KeyValuePair;
 pub const Value = parsing.Value;
 
