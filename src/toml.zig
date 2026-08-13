@@ -21,7 +21,7 @@ pub fn parseAlloc(allocator: std.mem.Allocator, comptime T: type, text: []const 
     const tokens = try tokenization.tokenize(&arena, text);
     const pairs = try parsing.parse(&arena, tokens);
 
-    return fromValue(allocator, T, .{
+    return fromValueAlloc(allocator, T, .{
         .table = std.ArrayList(KeyValuePair).fromOwnedSlice(pairs),
     });
 }
@@ -33,7 +33,7 @@ pub fn parseRaw(arena: *std.heap.ArenaAllocator, text: []const u8) !Value {
     return .{ .table = std.ArrayList(KeyValuePair).fromOwnedSlice(pairs) };
 }
 
-pub fn fromValue(allocator: std.mem.Allocator, comptime T: type, value: Value) !T {
+pub fn fromValueAlloc(allocator: std.mem.Allocator, comptime T: type, value: Value) !T {
     switch (@typeInfo(T)) {
         .int => {
             if (value != .integer) return TomlError.TypeMismatch;
@@ -44,7 +44,7 @@ pub fn fromValue(allocator: std.mem.Allocator, comptime T: type, value: Value) !
             .float => |float| return @floatCast(float),
             else => return TomlError.TypeMismatch,
         },
-        .optional => |info| return try fromValue(allocator, info.child, value),
+        .optional => |info| return try fromValueAlloc(allocator, info.child, value),
         .@"struct" => |info| {
             if (value != .table) return TomlError.TypeMismatch;
 
@@ -58,7 +58,7 @@ pub fn fromValue(allocator: std.mem.Allocator, comptime T: type, value: Value) !
             inline for (info.fields, 0..) |field, i| {
                 if (!field.is_comptime) {
                     if (findPair(value.table.items, field.name)) |pair| {
-                        @field(result, field.name) = try fromValue(allocator, field.type, pair.value);
+                        @field(result, field.name) = try fromValueAlloc(allocator, field.type, pair.value);
                     } else if (field.defaultValue()) |default| {
                         @field(result, field.name) = try mem.dupe(allocator, field.type, default);
                     } else if (@typeInfo(field.type) == .optional) {
@@ -83,7 +83,7 @@ pub fn fromValue(allocator: std.mem.Allocator, comptime T: type, value: Value) !
             errdefer for (result[0..filled]) |item| mem.deinit(allocator, info.child, item);
 
             for (value.array.items, 0..) |item, i| {
-                result[i] = try fromValue(allocator, info.child, item);
+                result[i] = try fromValueAlloc(allocator, info.child, item);
                 filled = i + 1;
             }
 
@@ -120,7 +120,7 @@ pub fn fromValue(allocator: std.mem.Allocator, comptime T: type, value: Value) !
                     }
 
                     for (array.items, 0..) |item, i| {
-                        result[i] = try fromValue(allocator, info.child, item);
+                        result[i] = try fromValueAlloc(allocator, info.child, item);
                         filled = i + 1;
                     }
 
@@ -770,7 +770,7 @@ test "parseRaw: fills a type from a value the caller selects" {
     const entities = findPair(root.table.items, "entity").?.value.array.items;
     const component = findPair(entities[0].table.items, "Transform").?;
 
-    const transform = try fromValue(allocator, Transform, component.value);
+    const transform = try fromValueAlloc(allocator, Transform, component.value);
     defer mem.deinit(allocator, Transform, transform);
 
     try std.testing.expectEqual([4]f32{ 0, 1.75, 0, 1 }, transform.position);
